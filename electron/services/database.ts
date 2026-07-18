@@ -1,11 +1,11 @@
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { app } from 'electron';
-import * as path from 'path';
-import * as fs from 'fs';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
 
-let db: Database.Database | null = null;
+let db: DatabaseSync | null = null;
 
-export function getDb(): Database.Database {
+export function getDb(): DatabaseSync {
   if (db) return db;
 
   let dbPath: string;
@@ -21,34 +21,56 @@ export function getDb(): Database.Database {
     dbPath = path.join(process.cwd(), 'izbul_reborn.db');
   }
 
-  db = new Database(dbPath);
+  db = new DatabaseSync(dbPath);
   
   // Set journal mode to WAL for high-concurrency performance
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
+  db.exec('PRAGMA journal_mode = WAL;');
+  db.exec('PRAGMA synchronous = NORMAL;');
+  db.exec('PRAGMA temp_store = MEMORY;');
+  db.exec('PRAGMA mmap_size = 268435456;'); // 256MB
+
+  // Schema migration: if old table `document_index` exists (from better-sqlite3 schema), drop the old tables
+  try {
+    const oldTableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='document_index'").get();
+    if (oldTableCheck) {
+      console.log('Old schema detected (document_index table). Dropping old tables to recreate with external-content FTS5 schema...');
+      db.exec('DROP TABLE IF EXISTS folders;');
+      db.exec('DROP TABLE IF EXISTS files;');
+      db.exec('DROP TABLE IF EXISTS document_index;');
+    }
+  } catch (err) {
+    console.error('Failed to run migration check:', err);
+  }
 
   // Initialize tables
   db.exec(`
     CREATE TABLE IF NOT EXISTS folders (
-      path TEXT PRIMARY KEY,
+      id INTEGER PRIMARY KEY,
+      path TEXT UNIQUE NOT NULL,
       added_at INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS files (
-      path TEXT PRIMARY KEY,
+      id INTEGER PRIMARY KEY,
+      path TEXT UNIQUE NOT NULL,
       filename TEXT NOT NULL,
-      extension TEXT NOT NULL,
+      ext TEXT NOT NULL,
       mtime INTEGER NOT NULL,
       size INTEGER NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
       status TEXT CHECK( status IN ('pending', 'indexed', 'failed') ) NOT NULL DEFAULT 'pending',
       error_msg TEXT,
-      last_indexed_at INTEGER
+      indexed_at INTEGER NOT NULL
     );
 
-    CREATE VIRTUAL TABLE IF NOT EXISTS document_index USING fts5(
-      path,
-      content,
-      tokenize="unicode61 remove_diacritics 1"
+    CREATE INDEX IF NOT EXISTS idx_files_path_prefix ON files(path);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+      filename,
+      body,
+      content = 'files',
+      content_rowid = 'id',
+      tokenize = "unicode61 remove_diacritics 2"
     );
   `);
 
@@ -81,7 +103,8 @@ export const DatabaseService = {
   // Folder Operations
   getFolders(): FolderRecord[] {
     const database = getDb();
-    return database.prepare('SELECT path, added_at FROM folders ORDER BY added_at ASC').all() as FolderRecord[];
+    const rows = database.prepare('SELECT path, added_at FROM folders ORDER BY added_at ASC').all() as unknown as FolderRecord[];
+    return rows;
   },
 
   addFolder(folderPath: string): void {
@@ -91,84 +114,221 @@ export const DatabaseService = {
 
   removeFolder(folderPath: string): void {
     const database = getDb();
-    // Run in transaction to clean files belonging to the directory
-    const deleteTx = database.transaction(() => {
-      // Find all files in the database matching directory path prefix
-      const filesToRemove = database.prepare('SELECT path FROM files WHERE path LIKE ?').all(folderPath + '%') as { path: string }[];
-      
-      for (const file of filesToRemove) {
-        database.prepare('DELETE FROM document_index WHERE path = ?').run(file.path);
-        database.prepare('DELETE FROM files WHERE path = ?').run(file.path);
-      }
-      
-      database.prepare('DELETE FROM folders WHERE path = ?').run(folderPath);
-    });
+    // Clean files belonging to the directory
+    const like = folderPath.endsWith(path.sep) ? folderPath : folderPath + path.sep;
+    const rows = database.prepare(`SELECT id FROM files WHERE path LIKE ? || '%'`).all(like) as { id: number }[];
     
-    deleteTx();
+    database.exec('BEGIN IMMEDIATE;');
+    try {
+      const delFile = database.prepare('DELETE FROM files WHERE id = ?');
+      const delFts = database.prepare('DELETE FROM files_fts WHERE rowid = ?');
+      for (const r of rows) {
+        delFts.run(r.id);
+        delFile.run(r.id);
+      }
+      database.prepare('DELETE FROM folders WHERE path = ?').run(folderPath);
+      database.exec('COMMIT;');
+    } catch (err) {
+      database.exec('ROLLBACK;');
+      throw err;
+    }
   },
 
   // File Operations
   getFile(filePath: string): FileRecord | undefined {
     const database = getDb();
-    return database.prepare('SELECT * FROM files WHERE path = ?').get(filePath) as FileRecord | undefined;
+    const row = database.prepare('SELECT path, filename, ext as extension, mtime, size, status, error_msg, indexed_at as last_indexed_at FROM files WHERE path = ?').get(filePath) as any;
+    if (!row) return undefined;
+    return {
+      path: row.path,
+      filename: row.filename,
+      extension: row.extension,
+      mtime: Number(row.mtime),
+      size: Number(row.size),
+      status: row.status,
+      error_msg: row.error_msg || undefined,
+      last_indexed_at: Number(row.last_indexed_at)
+    };
   },
 
   getAllFiles(): FileRecord[] {
     const database = getDb();
-    return database.prepare('SELECT * FROM files').all() as FileRecord[];
+    const rows = database.prepare('SELECT path, filename, ext as extension, mtime, size, status, error_msg, indexed_at as last_indexed_at FROM files').all() as any[];
+    return rows.map(row => ({
+      path: row.path,
+      filename: row.filename,
+      extension: row.extension,
+      mtime: Number(row.mtime),
+      size: Number(row.size),
+      status: row.status,
+      error_msg: row.error_msg || undefined,
+      last_indexed_at: Number(row.last_indexed_at)
+    }));
   },
 
   upsertFile(record: FileRecord): void {
     const database = getDb();
-    database.prepare(`
-      INSERT INTO files (path, filename, extension, mtime, size, status, error_msg, last_indexed_at)
-      VALUES ($path, $filename, $extension, $mtime, $size, $status, $error_msg, $last_indexed_at)
-      ON CONFLICT(path) DO UPDATE SET
-        mtime = excluded.mtime,
-        size = excluded.size,
-        status = excluded.status,
-        error_msg = excluded.error_msg,
-        last_indexed_at = excluded.last_indexed_at
-    `).run({
-      path: record.path,
-      filename: record.filename,
-      extension: record.extension,
-      mtime: record.mtime,
-      size: record.size,
-      status: record.status,
-      error_msg: record.error_msg || null,
-      last_indexed_at: record.last_indexed_at || null
-    });
+    const existing = database.prepare('SELECT id FROM files WHERE path = ?').get(record.path) as { id: number } | undefined;
+    const now = Date.now();
+    database.exec('BEGIN IMMEDIATE;');
+    try {
+      let id: number;
+      if (existing) {
+        id = existing.id;
+        database.prepare(`
+          UPDATE files SET filename=?, ext=?, mtime=?, size=?, status=?, error_msg=?, indexed_at=? WHERE id=?
+        `).run(
+          record.filename,
+          record.extension,
+          record.mtime,
+          record.size,
+          record.status,
+          record.error_msg || null,
+          record.last_indexed_at || now,
+          id
+        );
+        database.prepare('DELETE FROM files_fts WHERE rowid = ?').run(id);
+      } else {
+        database.prepare(`
+          INSERT INTO files (path, filename, ext, mtime, size, status, error_msg, indexed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          record.path,
+          record.filename,
+          record.extension,
+          record.mtime,
+          record.size,
+          record.status,
+          record.error_msg || null,
+          record.last_indexed_at || now
+        );
+        id = Number(database.prepare("SELECT last_insert_rowid() AS id").get()!["id"]);
+      }
+      database.prepare('INSERT INTO files_fts (rowid, filename, body) VALUES (?, ?, ?)').run(id, record.filename, '');
+      database.exec('COMMIT;');
+    } catch (err) {
+      database.exec('ROLLBACK;');
+      throw err;
+    }
   },
 
   removeFile(filePath: string): void {
     const database = getDb();
-    const deleteTx = database.transaction(() => {
-      database.prepare('DELETE FROM document_index WHERE path = ?').run(filePath);
-      database.prepare('DELETE FROM files WHERE path = ?').run(filePath);
-    });
-    deleteTx();
+    const existing = database.prepare('SELECT id FROM files WHERE path = ?').get(filePath) as { id: number } | undefined;
+    if (!existing) return;
+    database.exec('BEGIN IMMEDIATE;');
+    try {
+      database.prepare('DELETE FROM files_fts WHERE rowid = ?').run(existing.id);
+      database.prepare('DELETE FROM files WHERE id = ?').run(existing.id);
+      database.exec('COMMIT;');
+    } catch (err) {
+      database.exec('ROLLBACK;');
+      throw err;
+    }
   },
 
   // FTS5 Virtual Index Operations
   updateIndex(filePath: string, content: string): void {
     const database = getDb();
-    const indexTx = database.transaction(() => {
-      database.prepare('DELETE FROM document_index WHERE path = ?').run(filePath);
-      database.prepare('INSERT INTO document_index (path, content) VALUES (?, ?)').run(filePath, content);
-    });
-    indexTx();
+    const existing = database.prepare('SELECT id, filename FROM files WHERE path = ?').get(filePath) as { id: number, filename: string } | undefined;
+    if (!existing) return;
+    database.exec('BEGIN IMMEDIATE;');
+    try {
+      database.prepare('UPDATE files SET body = ? WHERE id = ?').run(content, existing.id);
+      database.prepare('DELETE FROM files_fts WHERE rowid = ?').run(existing.id);
+      database.prepare('INSERT INTO files_fts (rowid, filename, body) VALUES (?, ?, ?)').run(existing.id, existing.filename, content);
+      database.exec('COMMIT;');
+    } catch (err) {
+      database.exec('ROLLBACK;');
+      throw err;
+    }
+  },
+
+  // Batch operations for performance optimization
+  upsertFilesBatch(records: any[]): void {
+    if (records.length === 0) return;
+    const database = getDb();
+    const findStmt = database.prepare("SELECT id FROM files WHERE path = ?");
+    const updateStmt = database.prepare(
+      `UPDATE files SET filename=?, ext=?, mtime=?, size=?, body=?, status=?, indexed_at=? WHERE id=?`
+    );
+    const insertStmt = database.prepare(
+      `INSERT INTO files (path, filename, ext, mtime, size, body, status, indexed_at) VALUES (?,?,?,?,?,?,?,?)`
+    );
+    const deleteFtsStmt = database.prepare(`DELETE FROM files_fts WHERE rowid = ?`);
+    const insertFtsStmt = database.prepare(
+      `INSERT INTO files_fts (rowid, filename, body) VALUES (?,?,?)`
+    );
+
+    database.exec("BEGIN IMMEDIATE;");
+    try {
+      const now = Date.now();
+      for (const r of records) {
+        const existing = findStmt.get(r.path) as { id: number } | undefined;
+        let id: number;
+        if (existing) {
+          id = existing.id;
+          updateStmt.run(r.filename, r.ext, r.mtimeMs, r.size, r.body, 'indexed', now, id);
+          deleteFtsStmt.run(id);
+        } else {
+          insertStmt.run(r.path, r.filename, r.ext, r.mtimeMs, r.size, r.body, 'indexed', now);
+          id = Number(database.prepare("SELECT last_insert_rowid() AS id").get()!["id"]);
+        }
+        insertFtsStmt.run(id, r.filename, r.body);
+      }
+      database.exec("COMMIT;");
+    } catch (err) {
+      database.exec("ROLLBACK;");
+      throw err;
+    }
+  },
+
+  pruneMissing(rootPath: string, keepPaths: Set<string>): number {
+    const database = getDb();
+    const like = rootPath.endsWith(path.sep) ? rootPath : rootPath + path.sep;
+    const rows = database
+      .prepare(`SELECT id, path FROM files WHERE path LIKE ? || '%'`)
+      .all(like) as { id: number; path: string }[];
+
+    const toDelete = rows.filter((r) => !keepPaths.has(r.path));
+    if (toDelete.length === 0) return 0;
+
+    const delFile = database.prepare("DELETE FROM files WHERE id = ?");
+    const delFts = database.prepare("DELETE FROM files_fts WHERE rowid = ?");
+    database.exec("BEGIN IMMEDIATE;");
+    try {
+      for (const r of toDelete) {
+        delFts.run(r.id);
+        delFile.run(r.id);
+      }
+      database.exec("COMMIT;");
+    } catch (err) {
+      database.exec("ROLLBACK;");
+      throw err;
+    }
+    return toDelete.length;
+  },
+
+  getKnownFileStats(rootPath: string): Map<string, { mtime: number; size: number }> {
+    const database = getDb();
+    const like = rootPath.endsWith(path.sep) ? rootPath : rootPath + path.sep;
+    const rows = database
+      .prepare(`SELECT path, mtime, size FROM files WHERE path LIKE ? || '%'`)
+      .all(like) as { path: string; mtime: number; size: number }[];
+    const map = new Map<string, { mtime: number; size: number }>();
+    for (const r of rows) {
+      map.set(r.path, { mtime: Number(r.mtime), size: Number(r.size) });
+    }
+    return map;
   },
 
   // Helper to parse complex query syntax securely for FTS5 MATCH
   parseSearchQuery(query: string): string {
-    // 1. Balance double quotes
     let quoteCount = (query.match(/"/g) || []).length;
     if (quoteCount % 2 !== 0) {
       query += '"';
     }
 
-    // 2. Tokenize preserving double-quoted phrases and grouping syntax
     const tokenRegex = /(-?"[^"]+")|(-?[^\s"()]+)|(OR|AND|NOT|\(|\))/gi;
     const tokens: string[] = [];
     let match;
@@ -188,13 +348,12 @@ export const DatabaseService = {
         if (parsedTokens.length === 0) continue;
         const lastToken = parsedTokens[parsedTokens.length - 1].toUpperCase();
         if (lastToken === 'AND' || lastToken === 'OR' || lastToken === 'NOT') {
-          continue; // avoid repeating operators
+          continue;
         }
         parsedTokens.push(upperToken);
       } else if (token === '(' || token === ')') {
         parsedTokens.push(token);
       } else {
-        // Exclusions (-term or -"phrase")
         if (token.startsWith('-')) {
           const actualTerm = token.slice(1);
           if (actualTerm.length > 0) {
@@ -219,7 +378,6 @@ export const DatabaseService = {
             formattedTerm = token.endsWith('*') ? token : `${token}*`;
           }
           
-          // Implicit AND
           if (parsedTokens.length > 0) {
             const lastToken = parsedTokens[parsedTokens.length - 1];
             const lastUpper = lastToken.toUpperCase();
@@ -237,7 +395,6 @@ export const DatabaseService = {
       }
     }
 
-    // Strip trailing operators
     while (parsedTokens.length > 0) {
       const last = parsedTokens[parsedTokens.length - 1].toUpperCase();
       if (last === 'AND' || last === 'OR' || last === 'NOT') {
@@ -247,7 +404,6 @@ export const DatabaseService = {
       }
     }
 
-    // Parentheses balancing
     let openCount = 0;
     const balancedTokens: string[] = [];
     for (const token of parsedTokens) {
@@ -274,24 +430,21 @@ export const DatabaseService = {
   // Full-text content search using FTS5 match and snippet
   searchContent(query: string): SearchResult[] {
     const database = getDb();
-    
-    // Parse the query safely into FTS5 syntax
     const ftsQuery = this.parseSearchQuery(query);
 
     if (!ftsQuery) return [];
 
     try {
-      // Return snippet with bold markup around matches
       return database.prepare(`
         SELECT 
           f.path,
           f.filename,
-          snippet(document_index, 1, '<b>', '</b>', '...', 25) as snippet
-        FROM document_index
-        JOIN files f ON f.path = document_index.path
-        WHERE document_index MATCH ?
+          snippet(files_fts, 1, '<b>', '</b>', '...', 25) as snippet
+        FROM files_fts
+        JOIN files f ON f.id = files_fts.rowid
+        WHERE files_fts MATCH ?
         ORDER BY rank LIMIT 50
-      `).all(ftsQuery) as SearchResult[];
+      `).all(ftsQuery) as unknown as SearchResult[];
     } catch (err) {
       console.error('FTS5 query search failed:', err, 'Query was:', ftsQuery);
       return [];
@@ -303,16 +456,13 @@ export const DatabaseService = {
     database.exec(`
       DROP TABLE IF EXISTS folders;
       DROP TABLE IF EXISTS files;
-      DROP TABLE IF EXISTS document_index;
+      DROP TABLE IF EXISTS files_fts;
     `);
     
-    // Close connection to let database reinitialize
     if (db) {
-      db.close();
       db = null;
     }
     
-    // Reinitialize
     getDb();
   }
 };
