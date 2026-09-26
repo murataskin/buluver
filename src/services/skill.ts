@@ -41,8 +41,8 @@ Before searching, verify monitored directories and indexed document counts.
 Query the corpus using the optimal search mode:
 
 - **Modes:**
-  - \`hybrid\` (Default): Combines FTS5 lexical match and cosine vector similarity using Reciprocal Rank Fusion. Best for conceptual legal queries (e.g., \`kıdem tazminatı fazla mesai\`, \`haksız fesih\`).
-  - \`keyword\`: Exact lexical matching via SQLite FTS5 \`unicode61\`. Best for specific file names, exact case numbers, or explicit party names (e.g., \`2024/3682\`, \`Doğuş Otel\`).
+  - \`keyword\` (Default): Fast, exact lexical matching via SQLite FTS5 with full Boolean expressions (\`AND\`, \`OR\`, \`NOT\`, \`-\`, \`""\`, \`*\`). Best for precise legal terms, specific file names, exact case numbers, or explicit party names.
+  - \`hybrid\`: Combines FTS5 lexical match and cosine vector similarity using Reciprocal Rank Fusion. Best for broad conceptual legal queries (e.g., \`kıdem tazminatı fazla mesai\`).
   - \`infix\` (Trigram): Substring matching via SQLite FTS5 \`trigram\` tokenizer. Best for searching word fragments from the middle (e.g., \`gıtay\`), partial docket numbers (e.g., \`3682\`), or statutory articles (e.g., \`107/2\`). Requires >=3 characters.
   - \`semantic\`: Pure vector cosine similarity over 800-character chunks. Best for natural language questions.
 - **MCP:** Call \`search({ query: string, mode?: "hybrid" | "keyword" | "semantic" | "infix", limit?: number })\`.

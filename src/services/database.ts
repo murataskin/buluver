@@ -772,7 +772,7 @@ export const DatabaseService = {
     }
   },
 
-  search(query: string, mode: 'keyword' | 'semantic' | 'hybrid' | 'infix' = 'hybrid', queryEmbedding?: Float32Array, limit = 50): SearchResult[] {
+  search(query: string, mode: 'keyword' | 'semantic' | 'hybrid' | 'infix' = 'keyword', queryEmbedding?: Float32Array, limit = 50): SearchResult[] {
     const database = getDb();
 
     if (mode === 'infix') {

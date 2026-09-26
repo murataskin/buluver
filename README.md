@@ -172,11 +172,12 @@ buluver remove ~/Documents/Davalar
 ### 3. Arama (`search`)
 
 ```bash
-# Hibrit arama (FTS5 + Vektör RRF - Varsayılan)
-buluver search "kıdem tazminatı fazla mesai"
+# Hızlı anahtar kelime araması (FTS5 Boolean - Varsayılan)
+buluver search "kıdem tazminatı"
+buluver search "(temyiz OR istinaf) AND (miras OR alacak)"
 
-# Yalnızca anahtar kelime araması (FTS5 Boolean)
-buluver search "(temyiz OR istinaf) AND (miras OR alacak)" --mode keyword
+# Hibrit arama (FTS5 + Vektör RRF)
+buluver search "kıdem tazminatı fazla mesai" --mode hybrid
 
 # Trigram / Parça araması (Kelime ortasından, plaka, esas no parçası arama)
 buluver search "gıtay" --mode infix

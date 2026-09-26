@@ -38,10 +38,10 @@ export const McpServerService = {
       description: 'Hukuk belgeleri (UDF, DOCX, PDF, TXT) arasında tam metin (FTS5) ve anlamsal (vektör/hybrid RRF) arama yapar. Mahkeme, esas no, davacı, davalı ve özet bilgilerini döner.',
       parameters: z.object({
         query: z.string().describe('Aranacak hukuki kavram, ifade, esas/karar numarası veya taraf adı'),
-        mode: z.enum(['keyword', 'semantic', 'hybrid', 'infix', 'trigram']).optional().default('hybrid').describe('Arama modu: keyword (FTS5 tam metin), semantic (vektör benzerliği), hybrid (RRF birleştirilmiş), infix/trigram (kelime ortasından/parçadan arama)'),
+        mode: z.enum(['keyword', 'semantic', 'hybrid', 'infix', 'trigram']).optional().default('keyword').describe('Arama modu: keyword (FTS5 tam metin - varsayılan), hybrid (RRF birleştirilmiş), semantic (vektör benzerliği), infix/trigram (kelime ortasından/parçadan arama)'),
         limit: z.number().optional().default(20).describe('Döndürülecek maksimum sonuç sayısı (varsayılan: 20)')
       }),
-      execute: async ({ query, mode = 'hybrid', limit = 20 }) => {
+      execute: async ({ query, mode = 'keyword', limit = 20 }) => {
         try {
           const effectiveMode = (mode === 'trigram' ? 'infix' : mode) as 'keyword' | 'semantic' | 'hybrid' | 'infix';
           let queryEmbedding: Float32Array | undefined;

@@ -53,11 +53,11 @@ program
 program
   .command('search <query>')
   .description('Dizinlenmiş belgeler arasında anahtar kelime, vektör veya hibrit arama yapar')
-  .option('-m, --mode <mode>', 'Arama modu: hybrid, keyword, semantic veya infix (trigram parça arama)', 'hybrid')
+  .option('-m, --mode <mode>', 'Arama modu: keyword, hybrid, semantic veya infix (trigram parça arama)', 'keyword')
   .option('-l, --limit <number>', 'Maksimum sonuç sayısı', '10')
   .option('--json', 'Sonuçları ham JSON olarak yazdır')
   .action(async (query, options) => {
-    let mode = options.mode as 'hybrid' | 'keyword' | 'semantic' | 'infix';
+    let mode = options.mode as 'keyword' | 'hybrid' | 'semantic' | 'infix';
     if ((options.mode as string) === 'trigram') {
       mode = 'infix';
     }
