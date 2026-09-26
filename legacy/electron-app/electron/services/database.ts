@@ -1,11 +1,11 @@
-import { DatabaseSync } from 'node:sqlite';
+import Database from 'better-sqlite3';
 import { app } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
-let db: DatabaseSync | null = null;
+let db: Database.Database | null = null;
 
-export function getDb(): DatabaseSync {
+export function getDb(): Database.Database {
   if (db) return db;
 
   let dbPath: string;
@@ -21,13 +21,36 @@ export function getDb(): DatabaseSync {
     dbPath = path.join(process.cwd(), 'izbul_reborn.db');
   }
 
-  db = new DatabaseSync(dbPath);
+  db = new Database(dbPath);
   
-  // Set journal mode to WAL for high-concurrency performance
+  // Set journal mode to WAL for high-concurrency performance and enable foreign keys
+  db.exec('PRAGMA foreign_keys = ON;');
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec('PRAGMA temp_store = MEMORY;');
   db.exec('PRAGMA mmap_size = 268435456;'); // 256MB
+
+  // Register cosine similarity custom function
+  db.function('cosine_similarity', (emb1: any, emb2: any) => {
+    if (!emb1 || !emb2) return 0;
+    
+    // In better-sqlite3 custom functions, BLOB fields are passed as Buffer objects
+    const buf1 = Buffer.isBuffer(emb1) ? emb1 : Buffer.from(emb1);
+    const buf2 = Buffer.isBuffer(emb2) ? emb2 : Buffer.from(emb2);
+
+    const arr1 = new Float32Array(buf1.buffer, buf1.byteOffset, buf1.length / 4);
+    const arr2 = new Float32Array(buf2.buffer, buf2.byteOffset, buf2.length / 4);
+    
+    let dotProduct = 0, normA = 0, normB = 0;
+    const len = Math.min(arr1.length, arr2.length);
+    for (let i = 0; i < len; i++) {
+      dotProduct += arr1[i] * arr2[i];
+      normA += arr1[i] * arr1[i];
+      normB += arr2[i] * arr2[i];
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  });
 
   // Schema migration: if old table `document_index` exists (from better-sqlite3 schema), drop the old tables
   try {
@@ -72,12 +95,42 @@ export function getDb(): DatabaseSync {
       content_rowid = 'id',
       tokenize = "unicode61 remove_diacritics 2"
     );
+
+    CREATE TABLE IF NOT EXISTS file_metadata (
+      file_id INTEGER PRIMARY KEY,
+      summary TEXT,
+      tags TEXT, -- JSON string array
+      case_number TEXT,
+      court_name TEXT,
+      document_type TEXT,
+      plaintiff TEXT,
+      defendant TEXT,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS file_chunks (
+      id INTEGER PRIMARY KEY,
+      file_id INTEGER NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      embedding BLOB NOT NULL, -- Float32Array stored as binary blob
+      FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_file_chunks_file_id ON file_chunks(file_id);
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
   `);
 
   return db;
 }
 
 export interface FileRecord {
+  id?: number;
   path: string;
   filename: string;
   extension: string;
@@ -93,10 +146,23 @@ export interface FolderRecord {
   added_at: number;
 }
 
+export interface FileMetadata {
+  summary?: string;
+  tags?: string[];
+  case_number?: string;
+  court_name?: string;
+  document_type?: string;
+  plaintiff?: string;
+  defendant?: string;
+}
+
 export interface SearchResult {
   path: string;
   filename: string;
   snippet: string;
+  score?: number;
+  mode?: string;
+  metadata?: FileMetadata;
 }
 
 export const DatabaseService = {
@@ -137,9 +203,10 @@ export const DatabaseService = {
   // File Operations
   getFile(filePath: string): FileRecord | undefined {
     const database = getDb();
-    const row = database.prepare('SELECT path, filename, ext as extension, mtime, size, status, error_msg, indexed_at as last_indexed_at FROM files WHERE path = ?').get(filePath) as any;
+    const row = database.prepare('SELECT id, path, filename, ext as extension, mtime, size, status, error_msg, indexed_at as last_indexed_at FROM files WHERE path = ?').get(filePath) as any;
     if (!row) return undefined;
     return {
+      id: row.id,
       path: row.path,
       filename: row.filename,
       extension: row.extension,
@@ -166,13 +233,87 @@ export const DatabaseService = {
     }));
   },
 
-  upsertFile(record: FileRecord): void {
+  getSetting(key: string, defaultValue: string): string {
+    const database = getDb();
+    try {
+      const row = database.prepare('SELECT value FROM app_settings WHERE key = ?').get(key) as { value: string } | undefined;
+      return row ? row.value : defaultValue;
+    } catch {
+      return defaultValue;
+    }
+  },
+
+  setSetting(key: string, value: string): void {
+    const database = getDb();
+    database.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)').run(key, value);
+  },
+
+  /**
+   * Returns all indexed files that currently have no AI-generated summary,
+   * used for the one-time enrichment backfill.
+   */
+  getFilesWithoutSummary(): { id: number; path: string; filename: string }[] {
+    const database = getDb();
+    const rows = database.prepare(`
+      SELECT f.id, f.path, f.filename
+      FROM files f
+      LEFT JOIN file_metadata m ON f.id = m.file_id
+      WHERE f.status = 'indexed'
+        AND (m.file_id IS NULL OR m.summary IS NULL OR m.summary = '')
+    `).all() as any[];
+    return rows.map(r => ({ id: Number(r.id), path: r.path, filename: r.filename }));
+  },
+
+  /** Returns the stored plain-text body for a file by its primary key. */
+  getFileBody(fileId: number): string | null {
+    const database = getDb();
+    const row = database
+      .prepare('SELECT body FROM files WHERE id = ?')
+      .get(fileId) as { body: string } | undefined;
+    return row ? row.body : null;
+  },
+
+  getFilesDetail(): any[] {
+    const database = getDb();
+    const rows = database.prepare(`
+      SELECT 
+        f.id,
+        f.path,
+        f.filename,
+        f.ext as extension,
+        f.size,
+        f.status,
+        f.error_msg,
+        (CASE WHEN m.file_id IS NOT NULL THEN 1 ELSE 0 END) as has_metadata,
+        (CASE WHEN c.file_id IS NOT NULL THEN 1 ELSE 0 END) as has_embeddings
+      FROM files f
+      LEFT JOIN file_metadata m ON f.id = m.file_id
+      LEFT JOIN (
+        SELECT file_id FROM file_chunks GROUP BY file_id
+      ) c ON f.id = c.file_id
+      ORDER BY f.indexed_at DESC
+    `).all() as any[];
+
+    return rows.map(row => ({
+      id: row.id,
+      path: row.path,
+      filename: row.filename,
+      extension: row.extension,
+      size: Number(row.size),
+      status: row.status,
+      error_msg: row.error_msg || undefined,
+      has_metadata: Boolean(row.has_metadata),
+      has_embeddings: Boolean(row.has_embeddings)
+    }));
+  },
+
+  upsertFile(record: FileRecord): number {
     const database = getDb();
     const existing = database.prepare('SELECT id FROM files WHERE path = ?').get(record.path) as { id: number } | undefined;
     const now = Date.now();
+    let id: number;
     database.exec('BEGIN IMMEDIATE;');
     try {
-      let id: number;
       if (existing) {
         id = existing.id;
         database.prepare(`
@@ -202,10 +343,11 @@ export const DatabaseService = {
           record.error_msg || null,
           record.last_indexed_at || now
         );
-        id = Number(database.prepare("SELECT last_insert_rowid() AS id").get()!["id"]);
+        id = Number((database.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
       }
       database.prepare('INSERT INTO files_fts (rowid, filename, body) VALUES (?, ?, ?)').run(id, record.filename, '');
       database.exec('COMMIT;');
+      return id;
     } catch (err) {
       database.exec('ROLLBACK;');
       throw err;
@@ -245,8 +387,8 @@ export const DatabaseService = {
   },
 
   // Batch operations for performance optimization
-  upsertFilesBatch(records: any[]): void {
-    if (records.length === 0) return;
+  upsertFilesBatch(records: any[]): { id: number; path: string; filename: string; body: string }[] {
+    if (records.length === 0) return [];
     const database = getDb();
     const findStmt = database.prepare("SELECT id FROM files WHERE path = ?");
     const updateStmt = database.prepare(
@@ -260,6 +402,8 @@ export const DatabaseService = {
       `INSERT INTO files_fts (rowid, filename, body) VALUES (?,?,?)`
     );
 
+    const result: { id: number; path: string; filename: string; body: string }[] = [];
+
     database.exec("BEGIN IMMEDIATE;");
     try {
       const now = Date.now();
@@ -272,11 +416,13 @@ export const DatabaseService = {
           deleteFtsStmt.run(id);
         } else {
           insertStmt.run(r.path, r.filename, r.ext, r.mtimeMs, r.size, r.body, 'indexed', now);
-          id = Number(database.prepare("SELECT last_insert_rowid() AS id").get()!["id"]);
+          id = Number((database.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
         }
         insertFtsStmt.run(id, r.filename, r.body);
+        result.push({ id, path: r.path, filename: r.filename, body: r.body });
       }
       database.exec("COMMIT;");
+      return result;
     } catch (err) {
       database.exec("ROLLBACK;");
       throw err;
@@ -451,12 +597,257 @@ export const DatabaseService = {
     }
   },
 
+  upsertFileMetadata(fileId: number, metadata: Partial<FileMetadata>): void {
+    const database = getDb();
+    const existing = database.prepare('SELECT file_id FROM file_metadata WHERE file_id = ?').get(fileId);
+    const now = Date.now();
+    const tagsJson = metadata.tags ? JSON.stringify(metadata.tags) : null;
+    
+    if (existing) {
+      database.prepare(`
+        UPDATE file_metadata SET 
+          summary = COALESCE(?, summary),
+          tags = COALESCE(?, tags),
+          case_number = COALESCE(?, case_number),
+          court_name = COALESCE(?, court_name),
+          document_type = COALESCE(?, document_type),
+          plaintiff = COALESCE(?, plaintiff),
+          defendant = COALESCE(?, defendant),
+          updated_at = ?
+        WHERE file_id = ?
+      `).run(
+        metadata.summary !== undefined ? metadata.summary : null,
+        tagsJson,
+        metadata.case_number !== undefined ? metadata.case_number : null,
+        metadata.court_name !== undefined ? metadata.court_name : null,
+        metadata.document_type !== undefined ? metadata.document_type : null,
+        metadata.plaintiff !== undefined ? metadata.plaintiff : null,
+        metadata.defendant !== undefined ? metadata.defendant : null,
+        now,
+        fileId
+      );
+    } else {
+      database.prepare(`
+        INSERT INTO file_metadata (file_id, summary, tags, case_number, court_name, document_type, plaintiff, defendant, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        fileId,
+        metadata.summary || null,
+        tagsJson,
+        metadata.case_number || null,
+        metadata.court_name || null,
+        metadata.document_type || null,
+        metadata.plaintiff || null,
+        metadata.defendant || null,
+        now
+      );
+    }
+  },
+
+  saveFileChunks(fileId: number, chunks: { chunkIndex: number; text: string; embedding: Float32Array }[]): void {
+    const database = getDb();
+    database.exec('BEGIN IMMEDIATE;');
+    try {
+      database.prepare('DELETE FROM file_chunks WHERE file_id = ?').run(fileId);
+      const insertStmt = database.prepare(`
+        INSERT INTO file_chunks (file_id, chunk_index, text, embedding)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const c of chunks) {
+        const buffer = Buffer.from(c.embedding.buffer, c.embedding.byteOffset, c.embedding.byteLength);
+        insertStmt.run(fileId, c.chunkIndex, c.text, buffer);
+      }
+      database.exec('COMMIT;');
+    } catch (err) {
+      database.exec('ROLLBACK;');
+      throw err;
+    }
+  },
+
+  search(query: string, mode: 'keyword' | 'semantic' | 'hybrid' = 'hybrid', queryEmbedding?: Float32Array): SearchResult[] {
+    const database = getDb();
+    
+    // 1. Keyword search (FTS5)
+    let ftsResults: { id: number; path: string; filename: string; snippet: string; rank: number }[] = [];
+    const ftsQuery = this.parseSearchQuery(query);
+    if (ftsQuery && (mode === 'keyword' || mode === 'hybrid')) {
+      try {
+        ftsResults = database.prepare(`
+          SELECT 
+            f.id,
+            f.path,
+            f.filename,
+            snippet(files_fts, 1, '<b>', '</b>', '...', 25) as snippet,
+            rank
+          FROM files_fts
+          JOIN files f ON f.id = files_fts.rowid
+          WHERE files_fts MATCH ?
+          ORDER BY rank LIMIT 100
+        `).all(ftsQuery) as any[];
+      } catch (err) {
+        console.error('FTS5 query search failed:', err, 'Query was:', ftsQuery);
+      }
+    }
+
+    // 2. Semantic search
+    let semanticResults: { id: number; path: string; filename: string; snippet: string; similarity: number }[] = [];
+    if (queryEmbedding && (mode === 'semantic' || mode === 'hybrid')) {
+      try {
+        const buffer = Buffer.from(queryEmbedding.buffer, queryEmbedding.byteOffset, queryEmbedding.byteLength);
+        semanticResults = database.prepare(`
+          SELECT 
+            f.id,
+            f.path,
+            f.filename,
+            fc.text as snippet,
+            MAX(cosine_similarity(fc.embedding, ?)) as similarity
+          FROM file_chunks fc
+          JOIN files f ON f.id = fc.file_id
+          GROUP BY f.id
+          HAVING similarity > 0.1
+          ORDER BY similarity DESC
+          LIMIT 100
+        `).all(buffer) as any[];
+      } catch (err) {
+        console.error('Semantic query search failed:', err);
+      }
+    }
+
+    // 3. Merging / Selecting results based on mode
+    let merged: SearchResult[] = [];
+
+    if (mode === 'keyword') {
+      merged = ftsResults.map(r => ({
+        path: r.path,
+        filename: r.filename,
+        snippet: r.snippet,
+        score: -r.rank,
+        mode: 'keyword'
+      }));
+    } else if (mode === 'semantic') {
+      merged = semanticResults.map(r => ({
+        path: r.path,
+        filename: r.filename,
+        snippet: r.snippet,
+        score: r.similarity,
+        mode: 'semantic'
+      }));
+    } else {
+      // Hybrid mode: Reciprocal Rank Fusion (RRF)
+      const ftsRankMap = new Map<number, number>();
+      ftsResults.forEach((r, idx) => ftsRankMap.set(r.id, idx + 1));
+
+      const semRankMap = new Map<number, number>();
+      semanticResults.forEach((r, idx) => semRankMap.set(r.id, idx + 1));
+
+      const allIds = new Set<number>([
+        ...ftsResults.map(r => r.id),
+        ...semanticResults.map(r => r.id)
+      ]);
+
+      const rrfResults: { id: number; path: string; filename: string; snippet: string; score: number }[] = [];
+
+      for (const id of allIds) {
+        const ftsRank = ftsRankMap.get(id);
+        const semRank = semRankMap.get(id);
+
+        const rrfFts = ftsRank ? (1 / (60 + ftsRank)) : 0;
+        const rrfSem = semRank ? (1 / (60 + semRank)) : 0;
+        const score = rrfFts + rrfSem;
+
+        let snippet = '';
+        const ftsItem = ftsResults.find(r => r.id === id);
+        const semItem = semanticResults.find(r => r.id === id);
+
+        if (ftsItem && ftsItem.snippet) {
+          snippet = ftsItem.snippet;
+        } else if (semItem && semItem.snippet) {
+          snippet = semItem.snippet;
+        }
+
+        const item = ftsItem || semItem;
+        if (item) {
+          rrfResults.push({
+            id,
+            path: item.path,
+            filename: item.filename,
+            snippet,
+            score
+          });
+        }
+      }
+
+      rrfResults.sort((a, b) => b.score - a.score);
+      merged = rrfResults.map(r => ({
+        path: r.path,
+        filename: r.filename,
+        snippet: r.snippet,
+        score: r.score,
+        mode: 'hybrid'
+      }));
+    }
+
+    const finalResults = merged.slice(0, 50);
+
+    // Batch fetch metadata for final results
+    if (finalResults.length > 0) {
+      const paths = finalResults.map(r => r.path);
+      try {
+        const metadataRows = database.prepare(`
+          SELECT 
+            f.path,
+            m.summary,
+            m.tags,
+            m.case_number,
+            m.court_name,
+            m.document_type,
+            m.plaintiff,
+            m.defendant
+          FROM file_metadata m
+          JOIN files f ON f.id = m.file_id
+          WHERE f.path IN (${paths.map(() => '?').join(',')})
+        `).all(...paths) as any[];
+
+        const pathMetadataMap = new Map<string, any>();
+        for (const row of metadataRows) {
+          let tags: string[] = [];
+          if (row.tags) {
+            try {
+              tags = JSON.parse(row.tags);
+            } catch {
+              tags = [];
+            }
+          }
+          pathMetadataMap.set(row.path, {
+            summary: row.summary || undefined,
+            tags,
+            case_number: row.case_number || undefined,
+            court_name: row.court_name || undefined,
+            document_type: row.document_type || undefined,
+            plaintiff: row.plaintiff || undefined,
+            defendant: row.defendant || undefined
+          });
+        }
+
+        for (const r of finalResults) {
+          r.metadata = pathMetadataMap.get(r.path);
+        }
+      } catch (err) {
+        console.error('Failed to batch fetch metadata for search results:', err);
+      }
+    }
+
+    return finalResults;
+  },
+
   resetDatabase(): void {
     const database = getDb();
     database.exec(`
       DROP TABLE IF EXISTS folders;
       DROP TABLE IF EXISTS files;
       DROP TABLE IF EXISTS files_fts;
+      DROP TABLE IF EXISTS file_metadata;
+      DROP TABLE IF EXISTS file_chunks;
     `);
     
     if (db) {

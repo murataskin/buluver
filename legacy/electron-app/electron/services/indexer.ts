@@ -7,6 +7,8 @@ import { DatabaseService, FileRecord } from './database';
 import { UdfParser } from './udf-parser';
 import { walk, WalkedFile } from './walker';
 import type { ParseTask, ParsedRecord } from './indexWorker';
+import { generateEmbedding, chunkText } from './embeddings';
+import { generateMetadata } from './llm';
 
 let isIndexing = false;
 let stopRequested = false;
@@ -126,22 +128,61 @@ export const IndexerService = {
       const DB_COMMIT_BATCH_SIZE = 300;
       const WORKER_TASK_BATCH_SIZE = 40;
 
-      const flush = () => {
+      const flush = async () => {
         if (pendingBatch.length === 0) return;
-        DatabaseService.upsertFilesBatch(pendingBatch);
+        const inserted = DatabaseService.upsertFilesBatch(pendingBatch);
         parsed += pendingBatch.length;
         pendingBatch = [];
         throttleEmit(
           `İçerik dizinleniyor... (${parsed} yeni/değişen dosya)`,
           Math.min(99, 10 + Math.floor((parsed / (parsed + skipped || 1)) * 80))
         );
+
+        // Post-process metadata and embeddings for all inserted files
+        for (const item of inserted) {
+          try {
+            // 1. Fast heuristic parse (regex, always succeeds)
+            const heuristicMeta = UdfParser.extractMetadataHeuristics(item.body, item.filename);
+
+            // 2. AI enrichment — overrides heuristics; provides summary + tags
+            let finalMeta = heuristicMeta;
+            try {
+              const aiMeta = await generateMetadata(item.body);
+              finalMeta = {
+                ...heuristicMeta,
+                summary: aiMeta.summary,
+                tags: aiMeta.tags,
+              };
+            } catch (aiErr) {
+              console.error(`[AI] Metadata generation failed for ${item.path}, using heuristics:`, aiErr);
+            }
+            DatabaseService.upsertFileMetadata(item.id, finalMeta);
+
+            // 3. Generate embeddings from text chunks
+            const chunks = chunkText(item.body);
+            if (chunks.length > 0) {
+              const chunkData: { chunkIndex: number; text: string; embedding: Float32Array }[] = [];
+              for (let i = 0; i < chunks.length; i++) {
+                const embedding = await generateEmbedding(chunks[i]);
+                chunkData.push({
+                  chunkIndex: i,
+                  text: chunks[i],
+                  embedding
+                });
+              }
+              DatabaseService.saveFileChunks(item.id, chunkData);
+            }
+          } catch (err) {
+            console.error(`Post-processing failed for file ${item.path}:`, err);
+          }
+        }
       };
 
       const flushToParseBuffer = () => {
         if (toParseBuffer.length === 0) return;
         const batch = toParseBuffer;
         toParseBuffer = [];
-        const work = workerPool.run(batch).then((results) => {
+        const work = workerPool.run(batch).then(async (results) => {
           for (const r of results) {
             pendingBatch.push({
               path: r.path,
@@ -152,7 +193,9 @@ export const IndexerService = {
               body: r.body
             });
           }
-          if (pendingBatch.length >= DB_COMMIT_BATCH_SIZE) flush();
+          if (pendingBatch.length >= DB_COMMIT_BATCH_SIZE) {
+            await flush();
+          }
         });
         pendingWork.push(work);
       };
@@ -185,7 +228,7 @@ export const IndexerService = {
         // Flush remaining buffers
         flushToParseBuffer();
         await Promise.all(pendingWork);
-        flush();
+        await flush();
 
         // 3. Prune deleted files
         const removed = DatabaseService.pruneMissing(folder.path, keepPaths);
@@ -224,7 +267,7 @@ export const IndexerService = {
           if (ext === '.udf') {
             body = await UdfParser.parse(filePath);
           }
-          DatabaseService.upsertFile({
+          const id = DatabaseService.upsertFile({
             path: filePath,
             filename: path.basename(filePath),
             extension: ext,
@@ -235,6 +278,41 @@ export const IndexerService = {
           });
           if (body) {
             DatabaseService.updateIndex(filePath, body);
+
+            // Heuristic parse as baseline
+            const heuristicMeta = UdfParser.extractMetadataHeuristics(body, path.basename(filePath));
+
+            // AI enrichment with heuristic fallback
+            let finalMeta = heuristicMeta;
+            try {
+              const aiMeta = await generateMetadata(body);
+              finalMeta = {
+                ...heuristicMeta,
+                summary: aiMeta.summary,
+                tags: aiMeta.tags,
+              };
+            } catch (aiErr) {
+              console.error(`[AI] Metadata generation failed for ${filePath}:`, aiErr);
+            }
+            DatabaseService.upsertFileMetadata(id, finalMeta);
+
+            const chunks = chunkText(body);
+            if (chunks.length > 0) {
+              const chunkData: { chunkIndex: number; text: string; embedding: Float32Array }[] = [];
+              for (let i = 0; i < chunks.length; i++) {
+                try {
+                  const embedding = await generateEmbedding(chunks[i]);
+                  chunkData.push({
+                    chunkIndex: i,
+                    text: chunks[i],
+                    embedding
+                  });
+                } catch (err) {
+                  console.error(`Failed to generate embedding for chunk ${i} of file ${filePath}:`, err);
+                }
+              }
+              DatabaseService.saveFileChunks(id, chunkData);
+            }
           }
           this.emitStatus(`Dosya güncellendi: ${path.basename(filePath)}`, 100);
         } catch (err) {
@@ -278,5 +356,51 @@ export const IndexerService = {
 
   stopCurrentScan() {
     stopRequested = true;
-  }
+  },
+
+  /**
+   * One-time backfill: finds every indexed file that has no AI summary yet
+   * and runs AI metadata generation on it.
+   */
+  async enrichMissingMetadata(): Promise<void> {
+    const files = DatabaseService.getFilesWithoutSummary();
+    if (files.length === 0) {
+      console.log('[AI Enrichment] All files already have summaries. Skipping.');
+      return;
+    }
+
+    console.log(`[AI Enrichment] Starting one-time backfill for ${files.length} files.`);
+    this.emitStatus(`AI özet üretiliyor... (0/${files.length})`, 0);
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      try {
+        const body = DatabaseService.getFileBody(file.id);
+        if (!body || !body.trim()) continue;
+
+        const heuristicMeta = UdfParser.extractMetadataHeuristics(body, file.filename);
+
+        let finalMeta = heuristicMeta;
+        try {
+          const aiMeta = await generateMetadata(body);
+          finalMeta = {
+            ...heuristicMeta,
+            summary: aiMeta.summary,
+            tags: aiMeta.tags,
+          };
+        } catch (aiErr) {
+          console.error(`[AI Enrichment] Failed for ${file.path}:`, aiErr);
+        }
+
+        DatabaseService.upsertFileMetadata(file.id, finalMeta);
+        const progress = Math.floor(((i + 1) / files.length) * 100);
+        this.emitStatus(`AI özet üretiliyor... (${i + 1}/${files.length})`, progress);
+      } catch (err) {
+        console.error(`[AI Enrichment] Unexpected error for ${file.path}:`, err);
+      }
+    }
+
+    console.log('[AI Enrichment] Backfill complete.');
+    this.emitStatus('AI özet üretimi tamamlandı.', 100);
+  },
 };

@@ -6,3 +6,6 @@ dist-electron
 .DS_Store
 out
 .vscode
+.codegraph
+repomix-output.xml
+my-better-t-app/

@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Architecture Review — izbul</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 4 4; }
+      .leak { stroke: #dc2626; stroke-width: 2px; }
+      .deep { background: linear-gradient(135deg, #0f172a, #1e293b); color: white; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans leading-relaxed">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-12">
+      
+      <!-- HEADER -->
+      <header class="border-b border-slate-200 pb-8 space-y-4">
+        <div class="flex justify-between items-baseline">
+          <h1 class="text-3xl font-serif font-semibold tracking-tight text-slate-900">Architecture Review: izbul</h1>
+          <span class="text-sm text-slate-500 font-mono">2026-07-18</span>
+        </div>
+        
+        <!-- LEGEND -->
+        <div class="flex flex-wrap gap-6 text-xs font-mono text-slate-600 bg-white p-4 rounded-lg border border-slate-200 shadow-sm">
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-4 bg-white border border-slate-400 rounded"></span>
+            <span>Module</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-4 bg-slate-900 rounded"></span>
+            <span>Deep Module</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-6 h-0 border-t-2 border-dashed border-slate-400"></span>
+            <span>Seam</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-4 h-4 bg-red-100 border border-red-400 rounded text-red-600 text-center leading-3 font-bold">&rarr;</span>
+            <span class="text-red-600">Leakage</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- CANDIDATES -->
+      <section id="candidates" class="space-y-12">
+        <h2 class="text-xl font-serif font-bold text-slate-800 tracking-tight">Refactoring Candidates</h2>
+
+        <!-- CANDIDATE 1 -->
+        <article class="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-6">
+          <div class="flex flex-wrap justify-between items-start gap-4">
+            <div class="space-y-1">
+              <h3 class="text-lg font-serif font-semibold text-slate-900">1. Consolidate Storage behind a Deep Document Repository</h3>
+              <div class="flex gap-2">
+                <span class="px-2 py-0.5 text-xs font-semibold rounded bg-emerald-100 text-emerald-800">Strong</span>
+                <span class="px-2 py-0.5 text-xs font-semibold rounded bg-slate-100 text-slate-800">ports & adapters</span>
+              </div>
+            </div>
+            <div class="text-xs font-mono text-slate-400 bg-slate-50 px-3 py-1.5 rounded border border-slate-100">
+              electron/services/database.ts
+            </div>
+          </div>
+
+          <!-- BEFORE / AFTER DIAGRAMS -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 flex flex-col justify-between">
+              <h4 class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-3">Before (Shallow & Leaking)</h4>
+              <div class="h-[280px]">
+                <pre class="mermaid">
+                  flowchart TD
+                    IndexerService --> DB_Service
+                    MCP_Service --> DB_Service
+                    IPC_Handlers --> DB_Service
+                    
+                    subgraph DB_Service [Shallow DB Service - 12+ Public Methods]
+                      direction TB
+                      getDb
+                      getFolders
+                      upsertFilesBatch
+                      searchContent
+                      pruneMissing
+                      getKnownFileStats
+                    end
+                    
+                    DB_Service --> SQLite[(SQLite & FTS5)]
+                    IndexerService -. leak .-> getDb
+                    classDef leak stroke:#dc2626,stroke-width:2px;
+                    class getDb leak;
+                </pre>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 flex flex-col justify-between">
+              <h4 class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-3">After (Deep Repository Seam)</h4>
+              <div class="h-[280px]">
+                <pre class="mermaid">
+                  flowchart TD
+                    IndexerService --> Repo_Seam
+                    MCP_Service --> Repo_Seam
+                    IPC_Handlers --> Repo_Seam
+                    
+                    subgraph Repo_Seam [Document Repository Seam]
+                      direction TB
+                      saveDocuments
+                      search
+                      syncFolderState
+                    end
+                    
+                    subgraph Repo_Impl [Deep Implementation]
+                      SQLite_Adapter[(SQLite / FTS5 Engine)]
+                    end
+                    
+                    Repo_Seam --> Repo_Impl
+                    classDef deep fill:#0f172a,stroke:#1e293b,color:#ffffff;
+                    class Repo_Impl deep;
+                </pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- PROSE AND WINS -->
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6 pt-4 border-t border-slate-100 text-sm">
+            <div>
+              <h4 class="font-semibold text-slate-800">Problem</h4>
+              <p class="text-slate-600 mt-1">DatabaseService is a shallow module exposing SQL statements, raw connections, and 12+ separate database methods, forcing callers to coordinate batch transactions and FTS updates.</p>
+            </div>
+            <div>
+              <h4 class="font-semibold text-slate-800">Solution</h4>
+              <p class="text-slate-600 mt-1">Replace the database-leaking interface with a deep Repository presenting a domain-oriented interface (saveDocuments, search, syncFolderState).</p>
+            </div>
+            <div>
+              <h4 class="font-semibold text-slate-800">Benefits</h4>
+              <ul class="list-disc list-inside text-slate-600 space-y-1 mt-1 font-medium">
+                <li>locality: SQL logic is fully encapsulated</li>
+                <li>leverage: one interface, clean transactions</li>
+                <li>interface shrinks: from 12+ methods to 4</li>
+                <li>locality: FTS indexes update automatically</li>
+                <li>locality: database migration details are hidden</li>
+              </ul>
+            </div>
+          </div>
+        </article>
+
+        <!-- CANDIDATE 2 -->
+        <article class="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-6">
+          <div class="flex flex-wrap justify-between items-start gap-4">
+            <div class="space-y-1">
+              <h3 class="text-lg font-serif font-semibold text-slate-900">2. Encapsulate Worker Threads behind a Deep Parser Pipeline</h3>
+              <div class="flex gap-2">
+                <span class="px-2 py-0.5 text-xs font-semibold rounded bg-amber-100 text-amber-800">Worth exploring</span>
+                <span class="px-2 py-0.5 text-xs font-semibold rounded bg-slate-100 text-slate-800">in-process</span>
+              </div>
+            </div>
+            <div class="text-xs font-mono text-slate-400 bg-slate-50 px-3 py-1.5 rounded border border-slate-100">
+              electron/services/indexer.ts, indexWorker.ts, udf-parser.ts
+            </div>
+          </div>
+
+          <!-- BEFORE / AFTER DIAGRAMS -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 flex flex-col justify-between">
+              <h4 class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-3">Before (Exposed Orchestration)</h4>
+              <div class="h-[280px]">
+                <pre class="mermaid">
+                  flowchart TD
+                    IndexerService --> WorkerPool
+                    IndexerService --> walk
+                    
+                    subgraph Indexer_Impl [Indexer Service]
+                      WorkerPool
+                      Chokidar_Watcher
+                      scanAllRegisteredFolders
+                    end
+                    
+                    WorkerPool --> Workers[Node Worker Threads]
+                    Workers -. leak .-> UdfParser
+                    Chokidar_Watcher -. leak .-> UdfParser
+                    classDef leak stroke:#dc2626,stroke-width:2px;
+                    class UdfParser leak;
+                </pre>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 flex flex-col justify-between">
+              <h4 class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-3">After (Parser Pipeline Seam)</h4>
+              <div class="h-[280px]">
+                <pre class="mermaid">
+                  flowchart TD
+                    IndexerService --> ParserPipeline_Seam
+                    
+                    subgraph ParserPipeline_Seam [Parser Pipeline Interface]
+                      parseDocuments
+                    end
+                    
+                    subgraph Parser_Impl [Deep Pipeline Implementation]
+                      WorkerPool
+                      UdfParser
+                      PDF_DOCX_Fallbacks
+                    end
+                    
+                    ParserPipeline_Seam --> Parser_Impl
+                    classDef deep fill:#0f172a,stroke:#1e293b,color:#ffffff;
+                    class Parser_Impl deep;
+                </pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- PROSE AND WINS -->
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6 pt-4 border-t border-slate-100 text-sm">
+            <div>
+              <h4 class="font-semibold text-slate-800">Problem</h4>
+              <p class="text-slate-600 mt-1">The thread pool lifecycle, batch task queuing, and UDF parsing logic are exposed directly inside the indexing coordination loop.</p>
+            </div>
+            <div>
+              <h4 class="font-semibold text-slate-800">Solution</h4>
+              <p class="text-slate-600 mt-1">Introduce a deep Parser Pipeline interface that accepts file paths and returns parsed documents, hiding the multithreading details.</p>
+            </div>
+            <div>
+              <h4 class="font-semibold text-slate-800">Benefits</h4>
+              <ul class="list-disc list-inside text-slate-600 space-y-1 mt-1 font-medium">
+                <li>locality: thread lifecycle is fully hidden</li>
+                <li>leverage: single simple asynchronous call</li>
+                <li>testability: swap with synchronous mock parser</li>
+                <li>locality: worker error paths are isolated</li>
+                <li>locality: batching constraints live internally</li>
+              </ul>
+            </div>
+          </div>
+        </article>
+
+        <!-- CANDIDATE 3 -->
+        <article class="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-6">
+          <div class="flex flex-wrap justify-between items-start gap-4">
+            <div class="space-y-1">
+              <h3 class="text-lg font-serif font-semibold text-slate-900">3. Unify Sync Logic inside a Dedicated Sync Orchestrator</h3>
+              <div class="flex gap-2">
+                <span class="px-2 py-0.5 text-xs font-semibold rounded bg-amber-100 text-amber-800">Worth exploring</span>
+                <span class="px-2 py-0.5 text-xs font-semibold rounded bg-slate-100 text-slate-800">ports & adapters</span>
+              </div>
+            </div>
+            <div class="text-xs font-mono text-slate-400 bg-slate-50 px-3 py-1.5 rounded border border-slate-100">
+              electron/services/indexer.ts, walker.ts
+            </div>
+          </div>
+
+          <!-- BEFORE / AFTER DIAGRAMS -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 flex flex-col justify-between">
+              <h4 class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-3">Before (Fragmented Sync)</h4>
+              <div class="h-[280px]">
+                <pre class="mermaid">
+                  flowchart TD
+                    IPC_Handlers --> IndexerService
+                    IndexerService --> Walker
+                    IndexerService --> Watcher
+                    Watcher -. leak: ad-hoc DB write .-> DB_Service
+                    IndexerService -. leak: mtime checks .-> DB_Service
+                    classDef leak stroke:#dc2626,stroke-width:2px;
+                    class DB_Service leak;
+                </pre>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 flex flex-col justify-between">
+              <h4 class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-3">After (Encapsulated Sync Seam)</h4>
+              <div class="h-[280px]">
+                <pre class="mermaid">
+                  flowchart TD
+                    IPC_Handlers --> SyncOrchestrator_Seam
+                    
+                    subgraph SyncOrchestrator_Seam [Sync Orchestrator Seam]
+                      syncAll
+                      syncFolder
+                      startWatchers
+                    end
+                    
+                    subgraph Sync_Impl [Deep Sync Module]
+                      Diff_Engine
+                      Walker_Adapter
+                      Watcher_Manager
+                    end
+                    
+                    SyncOrchestrator_Seam --> Sync_Impl
+                    Sync_Impl --> Repo_Seam[(Document Repository)]
+                    classDef deep fill:#0f172a,stroke:#1e293b,color:#ffffff;
+                    class Sync_Impl deep;
+                </pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- PROSE AND WINS -->
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6 pt-4 border-t border-slate-100 text-sm">
+            <div>
+              <h4 class="font-semibold text-slate-800">Problem</h4>
+              <p class="text-slate-600 mt-1">Synchronization logic is split, with the scanning loop and watcher callbacks coordinating database writes and FTS updates ad-hoc.</p>
+            </div>
+            <div>
+              <h4 class="font-semibold text-slate-800">Solution</h4>
+              <p class="text-slate-600 mt-1">Unify folder walking, modification diffing, and document pruning under a single Sync Orchestrator.</p>
+            </div>
+            <div>
+              <h4 class="font-semibold text-slate-800">Benefits</h4>
+              <ul class="list-disc list-inside text-slate-600 space-y-1 mt-1 font-medium">
+                <li>locality: sync steps form explicit flow</li>
+                <li>leverage: one place triggers folder updates</li>
+                <li>locality: watching and scanning are unified</li>
+                <li>testability: verify walking without database side-effects</li>
+                <li>interface shrinks: callers trigger sync once</li>
+              </ul>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <!-- TOP RECOMMENDATION -->
+      <section id="top-recommendation" class="bg-slate-900 text-white rounded-xl p-6 space-y-4">
+        <span class="px-2.5 py-1 text-xs font-semibold rounded bg-emerald-500 text-slate-900 uppercase tracking-wider">Top Recommendation</span>
+        <h2 class="text-2xl font-serif font-bold leading-tight">1. Consolidate Storage behind a Deep Document Repository</h2>
+        <p class="text-slate-300 text-sm">
+          Deepening the database service yields the highest leverage first. By removing raw SQLite leaks (`getDb()`) and consolidating FTS index syncing inside the repository, we clean up the seams before refactoring the sync orchestrator or worker pipeline.
+        </p>
+        <div class="pt-2">
+          <a href="#candidates" class="inline-flex items-center text-xs font-semibold text-emerald-400 hover:text-emerald-300 transition-colors">
+            View Candidate Details &rarr;
+          </a>
+        </div>
+      </section>
+
+    </main>
+  </body>
+</html>

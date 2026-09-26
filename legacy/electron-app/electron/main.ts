@@ -1,8 +1,32 @@
+// Prevent crashes when stdout/stderr are closed or detached (e.g. write EIO, EPIPE)
+if (process.stdout) {
+  process.stdout.on('error', (err: any) => {
+    if (err.code === 'EIO' || err.code === 'EPIPE') {
+      // Ignore console write errors on closed pipes
+    }
+  });
+}
+if (process.stderr) {
+  process.stderr.on('error', (err: any) => {
+    if (err.code === 'EIO' || err.code === 'EPIPE') {
+      // Ignore console write errors on closed pipes
+    }
+  });
+}
+process.on('uncaughtException', (err: any) => {
+  if (err.code === 'EIO' || err.code === 'EPIPE') {
+    return; // Ignore broken pipes/EIO crashes from console logging
+  }
+  console.error('Unhandled Exception:', err);
+});
+
 import { app, BrowserWindow, dialog, globalShortcut, ipcMain, Menu, Tray } from 'electron';
-import * as path from 'path';
+import * as path from 'node:path';
 import { DatabaseService } from './services/database';
 import { IndexerService } from './services/indexer';
 import { McpServerService } from './services/mcp';
+import { generateEmbedding } from './services/embeddings';
+import { getLLMSettings, saveLLMSettings, testLLMConnection } from './services/llm';
 
 let mainWindow: BrowserWindow | null = null;
 let searchWindow: BrowserWindow | null = null;
@@ -54,6 +78,10 @@ function createSearchWindow() {
     alwaysOnTop: true,
     show: false,
     skipTaskbar: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -88,19 +116,20 @@ function toggleSearchWindow() {
 function createTray() {
   // Use a placeholder icon or system default template icon
   tray = new Tray(path.join(__dirname, '../../resources/tray-icon.png'));
-  
+
   const contextMenu = Menu.buildFromTemplate([
-    { label: 'TBB-İzBul Aç', click: () => mainWindow?.show() },
+    { label: 'İzBul Aç', click: () => mainWindow?.show() },
     { label: 'Hızlı Arama (F3)', click: () => toggleSearchWindow() },
     { type: 'separator' },
-    { label: 'Çıkış', click: () => {
+    {
+      label: 'Çıkış', click: () => {
         isQuitting = true;
         app.quit();
       }
     }
   ]);
 
-  tray.setToolTip('TBB-İzBul');
+  tray.setToolTip('İzBul');
   tray.setContextMenu(contextMenu);
 
   tray.on('double-click', () => {
@@ -111,7 +140,7 @@ function createTray() {
 app.whenReady().then(() => {
   createMainWindow();
   createSearchWindow();
-  
+
   // Set up Indexer real-time progress broadcast callback
   IndexerService.setProgressCallback((status) => {
     mainWindow?.webContents.send('status-change', status);
@@ -121,8 +150,10 @@ app.whenReady().then(() => {
   // Start watches on configured folders
   IndexerService.startWatchingAll();
 
-  // Run initial scan in the background
-  IndexerService.scanAllRegisteredFolders().catch(console.error);
+  // Run initial scan in the background, then backfill AI metadata for any files missing summaries
+  IndexerService.scanAllRegisteredFolders()
+    .then(() => IndexerService.enrichMissingMetadata())
+    .catch(console.error);
 
   // Start embedded FastMCP server
   McpServerService.start(3012).catch(console.error);
@@ -162,12 +193,34 @@ app.on('window-all-closed', () => {
 // IPC HANDLERS DEFINITION
 // =============================================================
 
-ipcMain.handle('search', async (_, query: string) => {
+ipcMain.handle('search', async (_, query: string, mode: 'keyword' | 'semantic' | 'hybrid' = 'hybrid') => {
   try {
-    return DatabaseService.searchContent(query);
+    let queryEmbedding: Float32Array | undefined;
+    if (mode === 'semantic' || mode === 'hybrid') {
+      try {
+        queryEmbedding = await generateEmbedding(query);
+      } catch (err) {
+        console.error('Failed to generate embedding for search query:', err);
+      }
+    }
+    return DatabaseService.search(query, mode, queryEmbedding);
   } catch (err) {
     console.error('IPC search failed:', err);
     return [];
+  }
+});
+
+ipcMain.handle('update-metadata', async (_, filePath: string, metadata: any) => {
+  try {
+    const file = DatabaseService.getFile(filePath);
+    if (!file || file.id === undefined) {
+      throw new Error(`Dosya bulunamadı veya ID'si eksik: ${filePath}`);
+    }
+    DatabaseService.upsertFileMetadata(file.id, metadata);
+    return true;
+  } catch (err) {
+    console.error('IPC update-metadata failed:', err);
+    return false;
   }
 });
 
@@ -252,5 +305,113 @@ ipcMain.handle('select-folder', async () => {
   } catch (err) {
     console.error('IPC select-folder failed:', err);
     return null;
+  }
+});
+
+ipcMain.handle('get-active-model', async () => {
+  try {
+    return DatabaseService.getSetting('active_model', 'Xenova/paraphrase-multilingual-MiniLM-L12-v2');
+  } catch (err) {
+    console.error('IPC get-active-model failed:', err);
+    return 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
+  }
+});
+
+ipcMain.handle('set-active-model', async (_, modelName: string) => {
+  try {
+    DatabaseService.setSetting('active_model', modelName);
+    const { reloadPipeline } = require('./services/embeddings');
+    reloadPipeline();
+    return true;
+  } catch (err) {
+    console.error('IPC set-active-model failed:', err);
+    return false;
+  }
+});
+
+ipcMain.handle('install-model', async () => {
+  try {
+    const { getEmbeddingPipeline } = require('./services/embeddings');
+    // Trigger download & progress reporting in background
+    getEmbeddingPipeline().catch((err: any) => {
+      console.error('Background pipeline initialization failed:', err);
+    });
+    return true;
+  } catch (err) {
+    console.error('IPC install-model failed:', err);
+    return false;
+  }
+});
+
+ipcMain.handle('get-files-detail', async () => {
+  try {
+    return DatabaseService.getFilesDetail();
+  } catch (err) {
+    console.error('IPC get-files-detail failed:', err);
+    return [];
+  }
+});
+
+ipcMain.handle('get-active-llm-model', async () => {
+  try {
+    return DatabaseService.getSetting('active_llm_model', 'Xenova/LaMini-Flan-T5-248M');
+  } catch (err) {
+    console.error('IPC get-active-llm-model failed:', err);
+    return 'Xenova/LaMini-Flan-T5-248M';
+  }
+});
+
+ipcMain.handle('set-active-llm-model', async (_, modelName: string) => {
+  try {
+    DatabaseService.setSetting('active_llm_model', modelName);
+    const { reloadLlmPipeline } = require('./services/llm');
+    reloadLlmPipeline();
+    return true;
+  } catch (err) {
+    console.error('IPC set-active-llm-model failed:', err);
+    return false;
+  }
+});
+
+ipcMain.handle('install-llm-model', async () => {
+  // No-op for REST-based providers (Ollama/OpenAI/Gemini).
+  // Model management is handled outside the app (e.g. `ollama pull <model>`).
+  return true;
+});
+
+ipcMain.handle('get-llm-settings', async () => {
+  try {
+    return getLLMSettings();
+  } catch (err) {
+    console.error('IPC get-llm-settings failed:', err);
+    return { provider: 'ollama', model: 'qwen2.5:7b', apiKey: '', baseUrl: 'http://localhost:11434' };
+  }
+});
+
+ipcMain.handle('set-llm-settings', async (_, settings: any) => {
+  try {
+    saveLLMSettings(settings);
+    return true;
+  } catch (err) {
+    console.error('IPC set-llm-settings failed:', err);
+    return false;
+  }
+});
+
+ipcMain.handle('test-llm-connection', async () => {
+  try {
+    return await testLLMConnection();
+  } catch (err: any) {
+    return { ok: false, message: err?.message ?? String(err) };
+  }
+});
+
+ipcMain.handle('enrich-metadata', async () => {
+  try {
+    IndexerService.enrichMissingMetadata().catch(console.error);
+    return true;
+  } catch (err) {
+    console.error('IPC enrich-metadata failed:', err);
+    return false;
   }
 });
