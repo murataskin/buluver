@@ -174,8 +174,13 @@ buluver remove ~/Documents/Davalar
 # Hibrit arama (FTS5 + Vektör RRF - Varsayılan)
 buluver search "kıdem tazminatı fazla mesai"
 
-# Yalnızca anahtar kelime araması (FTS5)
-buluver search "2024/3682" --mode keyword
+# Yalnızca anahtar kelime araması (FTS5 Boolean)
+buluver search "(temyiz OR istinaf) AND (miras OR alacak)" --mode keyword
+
+# Trigram / Parça araması (Kelime ortasından, plaka, esas no parçası arama)
+buluver search "gıtay" --mode infix
+buluver search "3682" --mode infix
+buluver search "107/2" --mode infix
 
 # Yalnızca anlamsal vektör araması
 buluver search "işçinin haksız feshi durumunda hakları" --mode semantic

@@ -86,6 +86,14 @@ export function getDb(): DatabaseSync {
       tokenize = "unicode61 remove_diacritics 2"
     );
 
+    CREATE VIRTUAL TABLE IF NOT EXISTS files_trigram USING fts5(
+      filename,
+      body,
+      content = 'files',
+      content_rowid = 'id',
+      tokenize = 'trigram'
+    );
+
     CREATE TABLE IF NOT EXISTS file_metadata (
       file_id INTEGER PRIMARY KEY,
       summary TEXT,
@@ -115,6 +123,16 @@ export function getDb(): DatabaseSync {
       value TEXT
     );
   `);
+
+  try {
+    const trigramCount = Number((db.prepare("SELECT count(*) as c FROM files_trigram").get() as any)?.c || 0);
+    const indexedCount = Number((db.prepare("SELECT count(*) as c FROM files WHERE status = 'indexed' AND body != ''").get() as any)?.c || 0);
+    if (trigramCount === 0 && indexedCount > 0) {
+      db.exec("INSERT INTO files_trigram(files_trigram) VALUES('rebuild');");
+    }
+  } catch (err) {
+    console.error('Trigram index auto-sync failed:', err);
+  }
 
   return db;
 }
@@ -176,8 +194,10 @@ export const DatabaseService = {
     try {
       const delFile = database.prepare('DELETE FROM files WHERE id = ?');
       const delFts = database.prepare('DELETE FROM files_fts WHERE rowid = ?');
+      const delTrigram = database.prepare('DELETE FROM files_trigram WHERE rowid = ?');
       for (const r of rows) {
         delFts.run(r.id);
+        delTrigram.run(r.id);
         delFile.run(r.id);
       }
       database.prepare('DELETE FROM folders WHERE path = ?').run(folderPath);
@@ -315,6 +335,7 @@ export const DatabaseService = {
           id
         );
         database.prepare('DELETE FROM files_fts WHERE rowid = ?').run(id);
+        database.prepare('DELETE FROM files_trigram WHERE rowid = ?').run(id);
       } else {
         const res = database.prepare(`
           INSERT INTO files (path, filename, ext, mtime, size, status, error_msg, indexed_at)
@@ -332,6 +353,7 @@ export const DatabaseService = {
         id = Number(res.lastInsertRowid);
       }
       database.prepare('INSERT INTO files_fts (rowid, filename, body) VALUES (?, ?, ?)').run(id, record.filename, '');
+      database.prepare('INSERT INTO files_trigram (rowid, filename, body) VALUES (?, ?, ?)').run(id, record.filename, '');
       database.exec('COMMIT;');
       return id;
     } catch (err) {
@@ -348,6 +370,7 @@ export const DatabaseService = {
     database.exec('BEGIN IMMEDIATE;');
     try {
       database.prepare('DELETE FROM files_fts WHERE rowid = ?').run(id);
+      database.prepare('DELETE FROM files_trigram WHERE rowid = ?').run(id);
       database.prepare('DELETE FROM files WHERE id = ?').run(id);
       database.exec('COMMIT;');
     } catch (err) {
@@ -365,7 +388,9 @@ export const DatabaseService = {
     try {
       database.prepare('UPDATE files SET body = ? WHERE id = ?').run(content, id);
       database.prepare('DELETE FROM files_fts WHERE rowid = ?').run(id);
+      database.prepare('DELETE FROM files_trigram WHERE rowid = ?').run(id);
       database.prepare('INSERT INTO files_fts (rowid, filename, body) VALUES (?, ?, ?)').run(id, String(existing.filename), content);
+      database.prepare('INSERT INTO files_trigram (rowid, filename, body) VALUES (?, ?, ?)').run(id, String(existing.filename), content);
       database.exec('COMMIT;');
     } catch (err) {
       database.exec('ROLLBACK;');
@@ -387,6 +412,10 @@ export const DatabaseService = {
     const insertFtsStmt = database.prepare(
       `INSERT INTO files_fts (rowid, filename, body) VALUES (?,?,?)`
     );
+    const deleteTrigramStmt = database.prepare(`DELETE FROM files_trigram WHERE rowid = ?`);
+    const insertTrigramStmt = database.prepare(
+      `INSERT INTO files_trigram (rowid, filename, body) VALUES (?,?,?)`
+    );
 
     const result: { id: number; path: string; filename: string; body: string }[] = [];
 
@@ -400,11 +429,13 @@ export const DatabaseService = {
           id = Number(existing.id);
           updateStmt.run(r.filename, r.ext, r.mtimeMs, r.size, r.body, 'indexed', now, id);
           deleteFtsStmt.run(id);
+          deleteTrigramStmt.run(id);
         } else {
           const res = insertStmt.run(r.path, r.filename, r.ext, r.mtimeMs, r.size, r.body, 'indexed', now);
           id = Number(res.lastInsertRowid);
         }
         insertFtsStmt.run(id, r.filename, r.body);
+        insertTrigramStmt.run(id, r.filename, r.body);
         result.push({ id, path: r.path, filename: r.filename, body: r.body });
       }
       database.exec("COMMIT;");
@@ -427,10 +458,12 @@ export const DatabaseService = {
 
     const delFile = database.prepare("DELETE FROM files WHERE id = ?");
     const delFts = database.prepare("DELETE FROM files_fts WHERE rowid = ?");
+    const delTrigram = database.prepare("DELETE FROM files_trigram WHERE rowid = ?");
     database.exec("BEGIN IMMEDIATE;");
     try {
       for (const r of toDelete) {
         delFts.run(Number(r.id));
+        delTrigram.run(Number(r.id));
         delFile.run(Number(r.id));
       }
       database.exec("COMMIT;");
@@ -653,8 +686,98 @@ export const DatabaseService = {
     }
   },
 
-  search(query: string, mode: 'keyword' | 'semantic' | 'hybrid' = 'hybrid', queryEmbedding?: Float32Array, limit = 50): SearchResult[] {
+  attachMetadataToResults(results: SearchResult[]): void {
+    if (results.length === 0) return;
     const database = getDb();
+    const paths = results.map(r => r.path);
+    try {
+      const metadataRows = database.prepare(`
+        SELECT 
+          f.path,
+          m.summary,
+          m.tags,
+          m.case_number,
+          m.court_name,
+          m.document_type,
+          m.plaintiff,
+          m.defendant
+        FROM file_metadata m
+        JOIN files f ON f.id = m.file_id
+        WHERE f.path IN (${paths.map(() => '?').join(',')})
+      `).all(...paths) as any[];
+
+      const pathMetadataMap = new Map<string, any>();
+      for (const row of metadataRows) {
+        let tags: string[] = [];
+        if (row.tags) {
+          try {
+            tags = JSON.parse(row.tags);
+          } catch {
+            tags = [];
+          }
+        }
+        pathMetadataMap.set(String(row.path), {
+          summary: row.summary ? String(row.summary) : undefined,
+          tags,
+          case_number: row.case_number ? String(row.case_number) : undefined,
+          court_name: row.court_name ? String(row.court_name) : undefined,
+          document_type: row.document_type ? String(row.document_type) : undefined,
+          plaintiff: row.plaintiff ? String(row.plaintiff) : undefined,
+          defendant: row.defendant ? String(row.defendant) : undefined
+        });
+      }
+
+      for (const r of results) {
+        r.metadata = pathMetadataMap.get(r.path);
+      }
+    } catch (err) {
+      console.error('Failed to batch fetch metadata for search results:', err);
+    }
+  },
+
+  searchInfix(query: string, limit = 50): SearchResult[] {
+    const database = getDb();
+    const clean = query.trim().replace(/["']/g, '');
+    if (clean.length < 3) {
+      return [];
+    }
+
+    try {
+      const rows = database.prepare(`
+        SELECT 
+          f.id,
+          f.path,
+          f.filename,
+          snippet(files_trigram, 1, '<b>', '</b>', '...', 25) as snippet,
+          bm25(files_trigram) as rank
+        FROM files_trigram
+        JOIN files f ON f.id = files_trigram.rowid
+        WHERE files_trigram MATCH ?
+        ORDER BY rank LIMIT ?
+      `).all(`"${clean}"`, limit) as any[];
+
+      const results: SearchResult[] = rows.map(r => ({
+        path: String(r.path),
+        filename: String(r.filename),
+        snippet: String(r.snippet),
+        score: -Number(r.rank),
+        mode: 'infix'
+      }));
+
+      this.attachMetadataToResults(results);
+      return results;
+    } catch (err) {
+      console.error('Trigram infix query search failed:', err);
+      return [];
+    }
+  },
+
+  search(query: string, mode: 'keyword' | 'semantic' | 'hybrid' | 'infix' = 'hybrid', queryEmbedding?: Float32Array, limit = 50): SearchResult[] {
+    const database = getDb();
+
+    if (mode === 'infix') {
+      return this.searchInfix(query, limit);
+    }
     
     // 1. Keyword search (FTS5)
     let ftsResults: { id: number; path: string; filename: string; snippet: string; rank: number }[] = [];
@@ -791,55 +914,7 @@ export const DatabaseService = {
     }
 
     const finalResults = merged.slice(0, limit);
-
-    // Batch fetch metadata for final results
-    if (finalResults.length > 0) {
-      const paths = finalResults.map(r => r.path);
-      try {
-        const metadataRows = database.prepare(`
-          SELECT 
-            f.path,
-            m.summary,
-            m.tags,
-            m.case_number,
-            m.court_name,
-            m.document_type,
-            m.plaintiff,
-            m.defendant
-          FROM file_metadata m
-          JOIN files f ON f.id = m.file_id
-          WHERE f.path IN (${paths.map(() => '?').join(',')})
-        `).all(...paths) as any[];
-
-        const pathMetadataMap = new Map<string, any>();
-        for (const row of metadataRows) {
-          let tags: string[] = [];
-          if (row.tags) {
-            try {
-              tags = JSON.parse(row.tags);
-            } catch {
-              tags = [];
-            }
-          }
-          pathMetadataMap.set(String(row.path), {
-            summary: row.summary ? String(row.summary) : undefined,
-            tags,
-            case_number: row.case_number ? String(row.case_number) : undefined,
-            court_name: row.court_name ? String(row.court_name) : undefined,
-            document_type: row.document_type ? String(row.document_type) : undefined,
-            plaintiff: row.plaintiff ? String(row.plaintiff) : undefined,
-            defendant: row.defendant ? String(row.defendant) : undefined
-          });
-        }
-
-        for (const r of finalResults) {
-          r.metadata = pathMetadataMap.get(r.path);
-        }
-      } catch (err) {
-        console.error('Failed to batch fetch metadata for search results:', err);
-      }
-    }
-
+    this.attachMetadataToResults(finalResults);
     return finalResults;
   },
 
@@ -849,6 +924,7 @@ export const DatabaseService = {
       DROP TABLE IF EXISTS folders;
       DROP TABLE IF EXISTS files;
       DROP TABLE IF EXISTS files_fts;
+      DROP TABLE IF EXISTS files_trigram;
       DROP TABLE IF EXISTS file_metadata;
       DROP TABLE IF EXISTS file_chunks;
       DROP TABLE IF EXISTS app_settings;

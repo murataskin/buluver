@@ -53,12 +53,24 @@ program
 program
   .command('search <query>')
   .description('Dizinlenmiş belgeler arasında anahtar kelime, vektör veya hibrit arama yapar')
-  .option('-m, --mode <mode>', 'Arama modu: hybrid, keyword, semantic', 'hybrid')
+  .option('-m, --mode <mode>', 'Arama modu: hybrid, keyword, semantic veya infix (trigram parça arama)', 'hybrid')
   .option('-l, --limit <number>', 'Maksimum sonuç sayısı', '10')
   .option('--json', 'Sonuçları ham JSON olarak yazdır')
   .action(async (query, options) => {
-    const mode = options.mode as 'hybrid' | 'keyword' | 'semantic';
+    let mode = options.mode as 'hybrid' | 'keyword' | 'semantic' | 'infix';
+    if ((options.mode as string) === 'trigram') {
+      mode = 'infix';
+    }
     const limit = parseInt(options.limit, 10) || 10;
+
+    if (mode === 'infix' && query.trim().length < 3) {
+      if (options.json) {
+        console.log(JSON.stringify({ error: 'Trigram (infix) araması en az 3 karakter gerektirir.' }));
+      } else {
+        console.log(pc.yellow(`\n⚠️  Trigram (infix) araması en az 3 karakter gerektirir.\n`));
+      }
+      return;
+    }
 
     let queryEmbedding: Float32Array | undefined;
     if (mode === 'semantic' || mode === 'hybrid') {
