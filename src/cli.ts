@@ -30,7 +30,7 @@ const program = new Command();
 
 program
   .name('buluver')
-  .description('Buluver: Yüksek performanslı Türk hukuk belgesi (UDF, DOCX, PDF) arama motoru, CLI ve AI MCP sunucusu')
+  .description('Buluver: Yüksek performanslı Türk hukuk belgesi (UDF, DOCX, DOC, PDF) arama motoru, CLI ve AI MCP sunucusu')
   .version('1.0.0');
 
 // 1. MCP Server Command
@@ -147,6 +147,7 @@ program
       const res = await IndexerService.scanAllRegisteredFolders({ withEmbeddings: options.embeddings !== false });
       console.log(pc.green(`✔ İndeksleme tamamlandı. Taranan: ${res.scanned}, İndekslenen: ${res.parsed}, Değişmeyen: ${res.skipped}`));
       await IndexerService.destroyPool();
+      process.exit(0);
     }
   });
 
@@ -214,6 +215,7 @@ program
     console.log(`  • İndekslenen dosya: ${res.parsed}`);
     console.log(`  • Atlanan (aynı):    ${res.skipped}`);
     console.log(`  • Silinen dosya:     ${res.removed}`);
+    process.exit(0);
   });
 
 // 7. Watch Command
@@ -256,7 +258,7 @@ program
 // 8. Read Document Command
 program
   .command('read <filePath>')
-  .description('UDF, DOCX veya PDF dosyasını ayrıştırarak içeriğini ve metadatasını ekrana yazar')
+  .description('UDF, DOCX, DOC veya PDF dosyasını ayrıştırarak içeriğini ve metadatasını ekrana yazar')
   .option('--meta-only', 'Yalnızca çıkarılan hukuki metadatayı göster')
   .action(async (filePath, options) => {
     const absPath = path.resolve(filePath);

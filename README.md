@@ -1,6 +1,6 @@
 # Buluver ⚖️🔍
 
-> **Sıfırdan Yazmaya Son: AI Ajanları İçin Avukatın Geçmiş Belgelerinden İlham Alma, Yazı Dilini / Üslubunu Benimseme ve Yerel Hukuk Arşivi (UDF, DOCX, PDF) Arama Motoru**  
+> **Sıfırdan Yazmaya Son: AI Ajanları İçin Avukatın Geçmiş Belgelerinden İlham Alma, Yazı Dilini / Üslubunu Benimseme ve Yerel Hukuk Arşivi (UDF, DOCX, DOC, PDF) Arama Motoru**  
 > *Mitigate writing from scratch: Empower AI agents to draw inspiration from the lawyer's authentic pre-written documents, adopting their real voice, tone, and legal craft via FastMCP and CLI.*
 
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org)
@@ -15,7 +15,7 @@
 AI asistanları hukuki dilekçe, sözleşme veya mütalaa kaleme alırken çoğunlukla **sıfırdan (from scratch)** genel geçer, basmakalıp ve yapay bir dil üretir. 
 
 **Buluver'in temel amacı bu sorunu kökten çözmektir:**
-Avukatın veya kullanıcının daha önce bizzat kaleme aldığı yüzlerce gerçek dilekçeyi, cevabı, ihtarnamayı ve emsal kararı (`.udf`, `.docx`, `.pdf`, `.txt`) yerel olarak tarar. AI ajanları yeni bir hukuki metin yazmadan önce Buluver aracılığıyla avukatın geçmiş çalışmalarına anında erişir:
+Avukatın veya kullanıcının daha önce bizzat kaleme aldığı yüzlerce gerçek dilekçeyi, cevabı, ihtarnamayı ve emsal kararı (`.udf`, `.docx`, `.doc`, `.pdf`, `.txt`) yerel olarak tarar. AI ajanları yeni bir hukuki metin yazmadan önce Buluver aracılığıyla avukatın geçmiş çalışmalarına anında erişir:
 * **İlham Almak (Inspiration):** Avukatın benzer uyuşmazlıklarda hangi hukuki mantığı, argüman örüntülerini ve Yargıtay içtihatlarını kullandığını görür.
 * **Yazı Dili ve Üslubu Öğrenmek (Tone & Voice):** Avukatın cümle kurma biçimini, mahkeme hitaplarını, itiraz sertliğini ve netice-i talep formülasyonunu benimser.
 * **Sıfırdan Yazmayı Engellemek (Mitigate Writing From Scratch):** Boş sayfadan başlamak yerine, avukatın yıllar içinde olgunlaşmış kendi birikimini referans alarak belgeyi üretir.
@@ -30,7 +30,7 @@ Electron gibi hantal masaüstü kabuklarından tamamen arındırılmıştır; do
 flowchart TD
     subgraph Girdiler["📁 Yerel Dosya Sistemi"]
         A1[".udf (UYAP XML Arşivi)"]
-        A2[".docx (Word OpenXML)"]
+        A2[".docx / .doc (Word Belgeleri)"]
         A3[".pdf (Metin Katmanlı PDF)"]
         A4[".txt / .md (Düz Metin)"]
     end
@@ -38,7 +38,7 @@ flowchart TD
     subgraph Tarama["⚡ Buluver Çekirdeği"]
         B["Walker (Kesintisiz Dizin Tarayıcı)"]
         C["WorkerPool (Çok Çekirdekli Ayrıştırıcı)"]
-        D["DocumentParser (UDF / DOCX / PDF Çözücü)"]
+        D["DocumentParser (UDF / DOCX / DOC / PDF Çözücü)"]
         E["Hukuki Varlık Çıkarıcı (Heuristics)"]
         F["EmbeddingService (ONNX MiniLM-L12)"]
     end
@@ -73,6 +73,7 @@ flowchart TD
 * **Kapsamlı Format Desteği:**
   * **`.udf` (UYAP):** ZIP arşivinden XML CDATA bloklarını okur; bozuk veya uncompressed XML dosyaları için otomatik düz metin kurtarma mekanizmasına sahiptir.
   * **`.docx` (Microsoft Word):** `mammoth` motoruyla tabloları ve gövde metnini çözer.
+  * **`.doc` (Word 97-2003 İkili Format):** `word-extractor` ile eski arşiv belgelerini ayrıştırır.
   * **`.pdf` (Adobe PDF):** `pdf-parse` ile çok sayfalı metin katmanlarını ayıklar.
   * **`.txt`, `.md`:** Düz metin dosyalarını UTF-8 olarak okur.
 * **Otomatik Hukuki Varlık Çıkarımı (Heuristic Extraction):**

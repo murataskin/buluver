@@ -4,6 +4,7 @@ import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import mammoth from 'mammoth';
 import pdfParse from 'pdf-parse';
+import WordExtractor from 'word-extractor';
 
 export interface DocumentMetadata {
   case_number?: string;
@@ -19,7 +20,7 @@ export class DocumentParser {
   /**
    * Supported file extensions
    */
-  static readonly SUPPORTED_EXTENSIONS = new Set(['.udf', '.docx', '.pdf', '.txt', '.text', '.md']);
+  static readonly SUPPORTED_EXTENSIONS = new Set(['.udf', '.docx', '.doc', '.pdf', '.txt', '.text', '.md']);
 
   static isSupported(filePath: string): boolean {
     const ext = path.extname(filePath).toLowerCase();
@@ -41,6 +42,8 @@ export class DocumentParser {
         return this.parseUdf(filePath);
       case '.docx':
         return this.parseDocx(filePath);
+      case '.doc':
+        return this.parseDoc(filePath);
       case '.pdf':
         return this.parsePdf(filePath);
       case '.txt':
@@ -104,6 +107,20 @@ export class DocumentParser {
       return this.cleanText(result.value);
     } catch (err: any) {
       throw new Error(`DOCX ayrıştırma hatası (${path.basename(filePath)}): ${err?.message || err}`);
+    }
+  }
+
+  /**
+   * Parses legacy Microsoft Word 97-2003 (.doc) binary documents using word-extractor
+   */
+  static async parseDoc(filePath: string): Promise<string> {
+    try {
+      const extractor = new WordExtractor();
+      const extracted = await extractor.extract(filePath);
+      const body = extracted.getBody() || '';
+      return this.cleanText(body);
+    } catch (err: any) {
+      throw new Error(`DOC ayrıştırma hatası (${path.basename(filePath)}): ${err?.message || err}`);
     }
   }
 

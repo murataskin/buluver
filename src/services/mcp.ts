@@ -73,7 +73,7 @@ export const McpServerService = {
     // 2. Read document tool
     s.addTool({
       name: 'read_document',
-      description: 'Belirtilen mutlak yoldaki UDF (.udf), Word (.docx), PDF (.pdf) veya metin dosyasının içeriğini ayrıştırarak temiz metin ve hukuki metadatalarını (mahkeme, esas no, taraflar) döner.',
+      description: 'Belirtilen mutlak yoldaki UDF (.udf), Word (.docx, .doc), PDF (.pdf) veya metin dosyasının içeriğini ayrıştırarak temiz metin ve hukuki metadatalarını (mahkeme, esas no, taraflar) döner.',
       parameters: z.object({
         filePath: z.string().describe('Okunacak belgenin mutlak dosya yolu')
       }),
@@ -83,7 +83,7 @@ export const McpServerService = {
             throw new Error(`Dosya bulunamadı: ${filePath}`);
           }
           if (!DocumentParser.isSupported(filePath)) {
-            throw new Error(`Desteklenmeyen dosya türü. Desteklenenler: .udf, .docx, .pdf, .txt, .md`);
+            throw new Error(`Desteklenmeyen dosya türü. Desteklenenler: .udf, .docx, .doc, .pdf, .txt, .md`);
           }
 
           const content = await DocumentParser.parse(filePath);

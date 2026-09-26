@@ -4,18 +4,18 @@ import * as os from 'node:os';
 
 export const BULUVER_SKILL_CONTENT = `---
 name: buluver
-description: Search and retrieve pre-written Turkish legal documents (.udf, .docx, .pdf, .txt) from the lawyer's local archive to understand their writing style, tone, and legal language ("ilham almak") before drafting. Prevents writing generic legal texts from scratch.
+description: Search and retrieve pre-written Turkish legal documents (.udf, .docx, .doc, .pdf, .txt) from the lawyer's local archive to understand their writing style, tone, and legal language ("ilham almak") before drafting. Prevents writing generic legal texts from scratch.
 ---
 
 # Buluver
 
-Local-first Turkish legal document search engine, CLI, and FastMCP server. Indexes and searches \`.udf\` (UYAP XML), \`.docx\`, \`.pdf\`, and \`.txt\` files with SQLite FTS5 lexical matching, local ONNX vector embeddings, and Reciprocal Rank Fusion (RRF) hybrid retrieval.
+Local-first Turkish legal document search engine, CLI, and FastMCP server. Indexes and searches \`.udf\` (UYAP XML), \`.docx\`, \`.doc\` (Word 97-2003), \`.pdf\`, and \`.txt\` files with SQLite FTS5 lexical matching, local ONNX vector embeddings, and Reciprocal Rank Fusion (RRF) hybrid retrieval.
 
 ## When to Reach
 
 - **Drafting with the Lawyer's Voice ("İlham Almak"):** When asked to write or propose a petition, response, objection, contract, or legal memo, search the user's past documents first. Understand their actual writing style, vocabulary, tone, and argumentation habits to avoid drafting generic text from scratch.
 - **Find Relevant Past Work & Precedents:** Locate Turkish court decisions, petitions, hearing minutes, or past case files across local directories.
-- **Extract & Read Authentic Text:** Read clean text and legal metadata from \`.udf\` (UYAP), \`.docx\`, or \`.pdf\` files without launching office applications.
+- **Extract & Read Authentic Text:** Read clean text and legal metadata from \`.udf\` (UYAP), \`.docx\`, \`.doc\`, or \`.pdf\` files without launching office applications.
 - **Query by Metadata or Concepts:** Query legal case records by court name, case/esas number, parties (davacı, davalı), or conceptual topic.
 - **Manage Local Index:** Manage monitored folders, ONNX embedding models, and local LLM connections.
 
@@ -95,6 +95,7 @@ Manage active ONNX embedding pipelines or external LLM providers (Ollama / OpenA
 ### Supported Document Types
 - \`.udf\`: UYAP document format (ZIP container with XML CDATA text).
 - \`.docx\`: Microsoft Word OpenXML via \`mammoth\`.
+- \`.doc\`: Legacy Microsoft Word 97-2003 binary via \`word-extractor\`.
 - \`.pdf\`: Portable Document Format text layers via \`pdf-parse\`.
 - \`.txt\`, \`.md\`: Plain text UTF-8 files.
 
