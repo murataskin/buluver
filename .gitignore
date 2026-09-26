@@ -1,11 +1,10 @@
 node_modules
 dist
-dist-electron
+dist-*
 *.db
 *.log
 .DS_Store
 out
 .vscode
 .codegraph
-repomix-output.xml
-my-better-t-app/
+
