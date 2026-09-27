@@ -3,10 +3,14 @@ import assert from 'node:assert/strict';
 import {
   createSearchEngine,
   parseSearchQuery,
+  normalizeTurkishForSearch,
+  generateCleanSnippet,
   type SearchRetriever,
   type RetrieverItem,
   type SearchResult
 } from '../src/services/search.js';
+import { shouldSkipFile, shouldSkipDir } from '../src/services/walker.js';
+import { DocumentParser } from '../src/services/doc-parser.js';
 
 describe('Search Query Normalizer (parseSearchQuery)', () => {
   test('balances trailing unclosed quotes', () => {
@@ -196,4 +200,136 @@ describe('Search Engine Seam (createSearchEngine)', () => {
     assert.match(response.degradedReason!, /Vektör araması devre dışı/);
     assert.equal(response.count, 1);
   });
+
+  test('filters search results by documentType and caseKind facets', async () => {
+    const retriever = createMockRetriever({
+      queryFts: () => [
+        { id: 1, path: '/doc1.udf', filename: 'doc1.udf', snippet: 'dava dilekcesi', score: -0.1 },
+        { id: 2, path: '/doc2.udf', filename: 'doc2.udf', snippet: 'cevap dilekcesi', score: -0.2 },
+        { id: 3, path: '/doc3.udf', filename: 'doc3.udf', snippet: 'sorusturma takipsizlik', score: -0.3 }
+      ],
+      attachMetadata: (results: SearchResult[]) => {
+        const metas: Record<string, any> = {
+          '/doc1.udf': { document_type: 'Dava Dilekçesi', case_kind: 'ESAS' },
+          '/doc2.udf': { document_type: 'Cevap Dilekçesi', case_kind: 'ESAS' },
+          '/doc3.udf': { document_type: 'Takipsizlik Kararı', case_kind: 'SORUSTURMA' }
+        };
+        for (const r of results) {
+          r.metadata = metas[r.path];
+        }
+      }
+    });
+
+    const engine = createSearchEngine({ retriever });
+    
+    // Filter by documentType
+    const typeRes = await engine.search('dilekçe', { documentType: 'Cevap Dilekçesi' });
+    assert.equal(typeRes.count, 1);
+    assert.equal(typeRes.results[0].filename, 'doc2.udf');
+
+    // Filter by caseKind
+    const kindRes = await engine.search('karar', { caseKind: 'SORUSTURMA' });
+    assert.equal(kindRes.count, 1);
+    assert.equal(kindRes.results[0].filename, 'doc3.udf');
+  });
 });
+
+describe('Turkish Search Normalization (normalizeTurkishForSearch)', () => {
+  test('correctly normalizes uppercase dotted and dotless I according to Turkish locale', () => {
+    assert.equal(normalizeTurkishForSearch('YARGITAY'), 'yargıtay');
+    assert.equal(normalizeTurkishForSearch('İSTANBUL'), 'istanbul');
+    assert.equal(normalizeTurkishForSearch('AĞIR CEZA'), 'ağır ceza');
+    assert.equal(normalizeTurkishForSearch('ÇEKİŞMELİ'), 'çekişmeli');
+  });
+
+  test('preserves already lowercase Turkish characters and handles empty strings', () => {
+    assert.equal(normalizeTurkishForSearch(''), '');
+    assert.equal(normalizeTurkishForSearch('yargıtay'), 'yargıtay');
+    assert.equal(normalizeTurkishForSearch('dilekçe'), 'dilekçe');
+  });
+});
+
+describe('Word-Boundary-Aware Clean Snippets (generateCleanSnippet)', () => {
+  const document = 'T.C. İSTANBUL 14. ASLİYE HUKUK MAHKEMESİ SAYIN HAKİMLİĞİNE DOSYA NO: 2024/142 Esas. DAVACI: Ahmet Yılmaz. KONU: Müvekkilin haksız fesih nedeniyle kıdem ve ihbar tazminatı taleplerinden ibarettir.';
+
+  test('centers snippet on match and preserves original document casing', () => {
+    const snippet = generateCleanSnippet(document, 'ihbar', 80);
+    assert.match(snippet, /<b>ihbar<\/b>/);
+    assert.match(snippet, /tazminatı/);
+  });
+
+  test('matches case-insensitively with Turkish characters while highlighting original casing', () => {
+    const snippet = generateCleanSnippet(document, 'istanbul', 80);
+    assert.match(snippet, /<b>İSTANBUL<\/b>/);
+  });
+
+  test('does not cut words in half at boundaries', () => {
+    const snippet = generateCleanSnippet(document, '2024/142', 70);
+    assert.match(snippet, /<b>2024\/142<\/b>/);
+    // Should not end with half a word
+    const plain = snippet.replace(/<[^>]+>/g, '').replace(/…/g, '').trim();
+    assert.ok(!plain.endsWith('Esa'), 'Should snap to whole word boundary');
+  });
+
+  test('returns ellipsis prefix and suffix when budget is exceeded', () => {
+    const snippet = generateCleanSnippet(document, 'kıdem', 50);
+    assert.ok(snippet.startsWith('…'));
+    assert.ok(snippet.endsWith('…'));
+  });
+});
+
+describe('File Filter & Skip Logic (shouldSkipFile & DocumentParser.isSupported)', () => {
+  test('rejects temporary Office lock files', () => {
+    assert.equal(shouldSkipFile('~$Dilekce.docx'), true);
+    assert.equal(DocumentParser.isSupported('/archive/~$Dilekce.docx'), false);
+  });
+
+  test('rejects macOS AppleDouble metadata and temporary files', () => {
+    assert.equal(shouldSkipFile('._Dilekce.pdf'), true);
+    assert.equal(DocumentParser.isSupported('/archive/._Dilekce.pdf'), false);
+    assert.equal(shouldSkipFile('draft.tmp'), true);
+    assert.equal(shouldSkipFile('.DS_Store'), true);
+    assert.equal(shouldSkipFile('Thumbs.db'), true);
+  });
+
+  test('accepts valid legal documents', () => {
+    assert.equal(shouldSkipFile('Dava_Dilekcesi.docx'), false);
+    assert.equal(DocumentParser.isSupported('/archive/Dava_Dilekcesi.docx'), true);
+    assert.equal(DocumentParser.isSupported('/archive/karar.udf'), true);
+    assert.equal(DocumentParser.isSupported('/archive/mutaala.pdf'), true);
+  });
+});
+
+describe('Directory Exclusion Logic (shouldSkipDir)', () => {
+  test('rejects Python virtual environments (.venv, venv, env)', () => {
+    assert.equal(shouldSkipDir('.venv'), true);
+    assert.equal(shouldSkipDir('venv'), true);
+    assert.equal(shouldSkipDir('env'), true);
+    assert.equal(shouldSkipDir('VENV'), true);
+  });
+
+  test('rejects developer package and build directories (.cargo, node_modules, caches, logs)', () => {
+    assert.equal(shouldSkipDir('.cargo'), true);
+    assert.equal(shouldSkipDir('.rustup'), true);
+    assert.equal(shouldSkipDir('node_modules'), true);
+    assert.equal(shouldSkipDir('.cache'), true);
+    assert.equal(shouldSkipDir('caches'), true);
+    assert.equal(shouldSkipDir('logs'), true);
+  });
+
+  test('rejects macOS system directories and app bundles', () => {
+    assert.equal(shouldSkipDir('Application Support'), true);
+    assert.equal(shouldSkipDir('application support'), true);
+    assert.equal(shouldSkipDir('Containers'), true);
+    assert.equal(shouldSkipDir('containers'), true);
+    assert.equal(shouldSkipDir('Slack.app'), true);
+  });
+
+  test('accepts valid user and legal archive folders', () => {
+    assert.equal(shouldSkipDir('Dilekceler'), false);
+    assert.equal(shouldSkipDir('Muvekkil_Arsivi'), false);
+    assert.equal(shouldSkipDir('2024_Davalar'), false);
+  });
+});
+
+

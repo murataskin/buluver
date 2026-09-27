@@ -71,6 +71,8 @@ program
   .description('Dizinlenmiş belgeler arasında anahtar kelime, vektör veya hibrit arama yapar')
   .option('-m, --mode <mode>', 'Arama modu: keyword, hybrid, semantic veya infix (trigram parça arama)', 'keyword')
   .option('-l, --limit <number>', 'Maksimum sonuç sayısı', '10')
+  .option('-t, --type <documentType>', 'Belge türüne göre filtrele (örn: "Dava Dilekçesi", "Bilirkişi Raporu")')
+  .option('-k, --kind <caseKind>', 'Dava/dosya türüne göre filtrele (ESAS, SORUSTURMA, DEGISIK_IS, TAKIP, BASVURU)')
   .option('--json', 'Sonuçları ham JSON olarak yazdır')
   .action(async (query, options) => {
     let mode = options.mode as SearchMode;
@@ -78,8 +80,10 @@ program
       mode = 'infix';
     }
     const limit = parseInt(options.limit, 10) || 10;
+    const documentType = options.type ? String(options.type) : undefined;
+    const caseKind = options.kind ? String(options.kind) : undefined;
 
-    const response = await SearchEngine.search(query, { mode, limit });
+    const response = await SearchEngine.search(query, { mode, limit, documentType, caseKind });
 
     if (response.degraded && response.degradedReason) {
       if (options.json) {
@@ -114,7 +118,9 @@ program
       if (r.metadata) {
         const parts: string[] = [];
         if (r.metadata.court_name) parts.push(`Mahkeme: ${r.metadata.court_name}`);
-        if (r.metadata.case_number) parts.push(`Esas: ${r.metadata.case_number}`);
+        if (r.metadata.case_number) parts.push(`Esas: ${r.metadata.case_number}${r.metadata.case_kind ? ` (${r.metadata.case_kind})` : ''}`);
+        if (r.metadata.document_type) parts.push(`Tür: ${r.metadata.document_type}`);
+        if (r.metadata.document_date) parts.push(`Tarih: ${r.metadata.document_date}`);
         if (r.metadata.plaintiff) parts.push(`Davacı: ${r.metadata.plaintiff}`);
         if (r.metadata.defendant) parts.push(`Davalı: ${r.metadata.defendant}`);
         if (parts.length > 0) {
@@ -317,10 +323,11 @@ program
 
       console.log(pc.bold('📋 Çıkarılan Hukuki Bilgiler:'));
       console.log(`  • Mahkeme/Makam: ${metadata.court_name || pc.dim('(Bulunamadı)')}`);
-      console.log(`  • Esas/Karar No: ${metadata.case_number || pc.dim('(Bulunamadı)')}`);
+      console.log(`  • Esas/Karar No: ${metadata.case_number ? `${metadata.case_number} ${metadata.case_kind ? `[${metadata.case_kind}]` : ''}` : pc.dim('(Bulunamadı)')}`);
+      console.log(`  • Belge Türü:    ${metadata.document_type || pc.dim('(Bulunamadı)')}`);
+      console.log(`  • Belge Tarihi:  ${metadata.document_date || pc.dim('(Bulunamadı)')}`);
       console.log(`  • Davacı/Talep:  ${metadata.plaintiff || pc.dim('(Bulunamadı)')}`);
       console.log(`  • Davalı/Karşı:  ${metadata.defendant || pc.dim('(Bulunamadı)')}`);
-      console.log(`  • Belge Türü:    ${metadata.document_type || pc.dim('(Bulunamadı)')}`);
 
       if (!options.metaOnly) {
         console.log(pc.bold('\n📝 Metin İçeriği:'));

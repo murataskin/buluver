@@ -6,6 +6,8 @@ export type SearchMode = 'keyword' | 'semantic' | 'hybrid' | 'infix';
 export interface SearchOptions {
   mode?: SearchMode;
   limit?: number;
+  documentType?: string;
+  caseKind?: string;
 }
 
 export interface SearchResponse {
@@ -33,6 +35,98 @@ export interface SearchRetriever {
 }
 
 export type Embedder = (text: string) => Promise<Float32Array>;
+
+/**
+ * Normalizes text for Turkish search: NFC normalization and locale-aware lowercase.
+ * Guarantees correct upper/lower mapping for Turkish characters like I/ı and İ/i.
+ */
+export function normalizeTurkishForSearch(text: string): string {
+  if (!text) return '';
+  return text.normalize('NFC').toLocaleLowerCase('tr-TR');
+}
+
+/**
+ * Generates a clean, word-boundary-aware snippet centered around the user query match.
+ * Prevents truncating words in half and provides natural context window.
+ */
+export function generateCleanSnippet(
+  content: string,
+  userQuery: string,
+  budget = 180,
+  highlightOpen = '<b>',
+  highlightClose = '</b>'
+): string {
+  if (!content || !content.trim()) {
+    return '';
+  }
+  const cleanContent = content.normalize('NFC').replace(/[\r\n\t\s]+/g, ' ').trim();
+  const cleanQuery = userQuery ? userQuery.normalize('NFC').trim() : '';
+  if (!cleanQuery) {
+    return cleanContent.length > budget ? cleanContent.substring(0, budget) + '…' : cleanContent;
+  }
+
+  const lowerContentTr = cleanContent.toLocaleLowerCase('tr-TR');
+  const lowerQueryTr = cleanQuery.toLocaleLowerCase('tr-TR');
+  let matchIndex = lowerContentTr.indexOf(lowerQueryTr);
+  let matchLength = cleanQuery.length;
+
+  if (matchIndex === -1) {
+    const lowerContentStd = cleanContent.toLowerCase();
+    const lowerQueryStd = cleanQuery.toLowerCase();
+    matchIndex = lowerContentStd.indexOf(lowerQueryStd);
+  }
+
+  if (matchIndex === -1) {
+    if (cleanContent.length <= budget) {
+      return cleanContent;
+    }
+    const endSpace = cleanContent.lastIndexOf(' ', budget);
+    const end = endSpace > 0 ? endSpace : budget;
+    return cleanContent.substring(0, end) + '…';
+  }
+
+  const matchStart = matchIndex;
+  const matchEnd = matchIndex + matchLength;
+  const matchedText = cleanContent.substring(matchStart, matchEnd);
+
+  const remainingBudget = Math.max(0, budget - matchLength);
+  const leftBudget = Math.floor(remainingBudget * 0.45);
+  const rightBudget = remainingBudget - leftBudget;
+
+  let rawStart = Math.max(0, matchStart - leftBudget);
+  let rawEnd = Math.min(cleanContent.length, matchEnd + rightBudget);
+
+  if (matchStart - leftBudget < 0) {
+    const extra = leftBudget - matchStart;
+    rawEnd = Math.min(cleanContent.length, rawEnd + extra);
+  } else if (matchEnd + rightBudget > cleanContent.length) {
+    const extra = matchEnd + rightBudget - cleanContent.length;
+    rawStart = Math.max(0, rawStart - extra);
+  }
+
+  let start = rawStart;
+  if (start > 0) {
+    const spaceAfter = cleanContent.indexOf(' ', start);
+    if (spaceAfter !== -1 && spaceAfter < matchStart) {
+      start = spaceAfter + 1;
+    }
+  }
+
+  let end = rawEnd;
+  if (end < cleanContent.length) {
+    const spaceBefore = cleanContent.lastIndexOf(' ', end);
+    if (spaceBefore !== -1 && spaceBefore > matchEnd) {
+      end = spaceBefore;
+    }
+  }
+
+  const leftPart = cleanContent.substring(start, matchStart);
+  const rightPart = cleanContent.substring(matchEnd, end);
+  const hasLeftEllipsis = start > 0;
+  const hasRightEllipsis = end < cleanContent.length;
+
+  return `${hasLeftEllipsis ? '…' : ''}${leftPart}${highlightOpen}${matchedText}${highlightClose}${rightPart}${hasRightEllipsis ? '…' : ''}`;
+}
 
 /**
  * Sanitizes and normalizes a user search query into valid SQLite FTS5 MATCH syntax.
@@ -191,7 +285,7 @@ export function createSearchEngine(deps: SearchEngineDependencies = {}): SearchE
 
       // 1. Infix / Trigram mode validation
       if (requestedMode === 'infix') {
-        const clean = query.replace(/["']/g, '').trim();
+        const clean = normalizeTurkishForSearch(query.replace(/["']/g, ' ')).replace(/\s+/g, ' ').trim();
         if (clean.length < 3) {
           return {
             query,
@@ -244,11 +338,12 @@ export function createSearchEngine(deps: SearchEngineDependencies = {}): SearchE
       }
 
       // 3. Keyword Search (FTS5)
+      const fetchLimit = (options.documentType || options.caseKind) ? Math.max(limit * 20, 200) : limit * 2;
       let ftsResults: RetrieverItem[] = [];
       const ftsQuery = parseSearchQuery(query);
       if (ftsQuery && (effectiveMode === 'keyword' || effectiveMode === 'hybrid')) {
         try {
-          ftsResults = await retriever.queryFts(ftsQuery, limit * 2);
+          ftsResults = await retriever.queryFts(ftsQuery, fetchLimit);
         } catch (err) {
           console.error('[SearchEngine] FTS5 search query error:', err, 'Query was:', ftsQuery);
         }
@@ -258,7 +353,7 @@ export function createSearchEngine(deps: SearchEngineDependencies = {}): SearchE
       let semanticResults: RetrieverItem[] = [];
       if (queryEmbedding && (effectiveMode === 'semantic' || effectiveMode === 'hybrid')) {
         try {
-          semanticResults = await retriever.queryVector(queryEmbedding, limit * 2);
+          semanticResults = await retriever.queryVector(queryEmbedding, fetchLimit);
         } catch (err) {
           console.error('[SearchEngine] Semantic vector search error:', err);
         }
@@ -338,8 +433,30 @@ export function createSearchEngine(deps: SearchEngineDependencies = {}): SearchE
         }));
       }
 
-      const finalResults = merged.slice(0, limit);
-      await retriever.attachMetadata(finalResults);
+      let candidateResults = merged;
+      if (options.documentType || options.caseKind) {
+        const preSlice = candidateResults.slice(0, Math.max(limit * 20, 200));
+        await retriever.attachMetadata(preSlice);
+
+        candidateResults = preSlice.filter((r) => {
+          if (options.documentType) {
+            const docType = (r.metadata?.document_type || '').toLocaleLowerCase('tr-TR');
+            const targetType = options.documentType.toLocaleLowerCase('tr-TR');
+            if (!docType.includes(targetType)) return false;
+          }
+          if (options.caseKind) {
+            const kind = (r.metadata?.case_kind || '').toUpperCase();
+            const targetKind = options.caseKind.toUpperCase();
+            if (kind !== targetKind) return false;
+          }
+          return true;
+        });
+      }
+
+      const finalResults = candidateResults.slice(0, limit);
+      if (!options.documentType && !options.caseKind) {
+        await retriever.attachMetadata(finalResults);
+      }
 
       return {
         query,

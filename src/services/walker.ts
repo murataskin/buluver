@@ -8,20 +8,50 @@ export interface WalkedFile {
   size: number;
 }
 
-const SKIP_DIRS = new Set([
+export const SKIP_DIRS = new Set([
   "node_modules",
   ".git",
+  ".svn",
+  ".hg",
   ".codegraph",
-  "$RECYCLE.BIN",
-  "System Volume Information",
-  ".Trash",
-  ".Trashes",
+  "$recycle.bin",
+  "system volume information",
+  ".trash",
+  ".trashes",
   ".fseventsd",
-  ".Spotlight-V100",
+  ".spotlight-v100",
+  ".npm",
+  ".pnpm-store",
+  ".yarn",
+  ".cargo",
+  ".rustup",
+  ".venv",
+  "venv",
+  "env",
+  ".cache",
+  "caches",
+  "application support",
+  "containers",
+  "logs",
+  "applications",
 ]);
+
+export function shouldSkipDir(dirName: string): boolean {
+  const lower = dirName.toLowerCase();
+  if (SKIP_DIRS.has(lower)) return true;
+  if (lower.endsWith(".app")) return true;
+  return false;
+}
 
 // macOS dataless placeholder flag (iCloud / OneDrive Files On-Demand)
 const SF_DATALESS = 0x40000000;
+
+export function shouldSkipFile(filename: string): boolean {
+  if (filename.startsWith('~$') || filename.startsWith('._')) return true;
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.tmp') || lower === '.ds_store' || lower === 'thumbs.db') return true;
+  return false;
+}
 
 export async function* walk(
   rootDir: string,
@@ -40,16 +70,17 @@ export async function* walk(
     }
 
     for (const entry of entries) {
-      if (entry.name.startsWith(".") && entry.isDirectory()) continue;
-      if (SKIP_DIRS.has(entry.name)) continue;
-
       const full = path.join(dir, entry.name);
 
       if (entry.isDirectory()) {
+        if (entry.name.startsWith(".") || shouldSkipDir(entry.name)) {
+          continue;
+        }
         stack.push(full);
         continue;
       }
       if (!entry.isFile()) continue;
+      if (shouldSkipFile(entry.name)) continue;
 
       const ext = path.extname(entry.name).toLowerCase();
       if (!DocumentParser.isSupported(full)) continue;

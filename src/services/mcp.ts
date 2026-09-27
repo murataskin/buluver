@@ -40,12 +40,14 @@ export const McpServerService = {
       parameters: z.object({
         query: z.string().describe('Aranacak hukuki kavram, ifade, esas/karar numarası veya taraf adı'),
         mode: z.enum(['keyword', 'semantic', 'hybrid', 'infix', 'trigram']).optional().default('keyword').describe('Arama modu: keyword (FTS5 tam metin - varsayılan), hybrid (RRF birleştirilmiş), semantic (vektör benzerliği), infix/trigram (kelime ortasından/parçadan arama)'),
-        limit: z.number().optional().default(20).describe('Döndürülecek maksimum sonuç sayısı (varsayılan: 20)')
+        limit: z.number().optional().default(20).describe('Döndürülecek maksimum sonuç sayısı (varsayılan: 20)'),
+        documentType: z.string().optional().describe('Belge türüne göre filtrele (örn: "Dava Dilekçesi", "Cevap Dilekçesi", "Bilirkişi Raporu", "Gerekçeli Karar")'),
+        caseKind: z.enum(['ESAS', 'SORUSTURMA', 'DEGISIK_IS', 'TAKIP', 'BASVURU']).optional().describe('Dava veya dosya türüne göre filtrele')
       }),
-      execute: async ({ query, mode = 'keyword', limit = 20 }) => {
+      execute: async ({ query, mode = 'keyword', limit = 20, documentType, caseKind }) => {
         try {
           const requestedMode = (mode === 'trigram' ? 'infix' : mode) as SearchMode;
-          const response = await SearchEngine.search(query, { mode: requestedMode, limit });
+          const response = await SearchEngine.search(query, { mode: requestedMode, limit, documentType, caseKind });
           return JSON.stringify({
             success: true,
             ...response

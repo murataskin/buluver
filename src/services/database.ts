@@ -102,8 +102,10 @@ export function getDb(): DatabaseSync {
       summary TEXT,
       tags TEXT, -- JSON string array
       case_number TEXT,
+      case_kind TEXT,
       court_name TEXT,
       document_type TEXT,
+      document_date TEXT,
       plaintiff TEXT,
       defendant TEXT,
       updated_at INTEGER NOT NULL,
@@ -126,6 +128,20 @@ export function getDb(): DatabaseSync {
       value TEXT
     );
   `);
+
+  // Safe schema migration for file_metadata
+  try {
+    const metaColumns = db.prepare('PRAGMA table_info(file_metadata)').all() as Array<{ name: string }>;
+    const colNames = metaColumns.map((c) => c.name);
+    if (!colNames.includes('case_kind')) {
+      db.exec('ALTER TABLE file_metadata ADD COLUMN case_kind TEXT;');
+    }
+    if (!colNames.includes('document_date')) {
+      db.exec('ALTER TABLE file_metadata ADD COLUMN document_date TEXT;');
+    }
+  } catch (err) {
+    console.error('file_metadata schema migration error:', err);
+  }
 
   try {
     const trigramCount = Number((db.prepare("SELECT count(*) as c FROM files_trigram").get() as any)?.c || 0);
@@ -161,8 +177,10 @@ export interface FileMetadata {
   summary?: string;
   tags?: string[];
   case_number?: string;
+  case_kind?: string;
   court_name?: string;
   document_type?: string;
+  document_date?: string;
   plaintiff?: string;
   defendant?: string;
 }

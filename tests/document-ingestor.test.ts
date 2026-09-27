@@ -34,7 +34,8 @@ describe('DocumentIngestor', () => {
 
     // Heuristics parsed directly in memory
     assert.ok(doc.metadata?.court_name?.includes('İŞ MAHKEMESİ'));
-    assert.equal(doc.metadata?.case_number, '2024/1234 E.');
+    assert.equal(doc.metadata?.case_number, '2024/1234');
+    assert.equal(doc.metadata?.case_kind, 'ESAS');
     assert.equal(doc.metadata?.plaintiff, 'Ahmet Yılmaz');
     assert.equal(doc.metadata?.defendant, 'ABC Lojistik A.Ş.');
     assert.ok(doc.metadata?.document_type?.includes('Kıdem'));

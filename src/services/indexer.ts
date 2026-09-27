@@ -8,7 +8,7 @@ import { FolderStore } from './folder-store.js';
 import { DocumentRepository } from './document-repository.js';
 import { DocumentParser } from './doc-parser.js';
 import { DocumentIngestor } from './document-ingestor.js';
-import { walk } from './walker.js';
+import { walk, shouldSkipDir, shouldSkipFile } from './walker.js';
 import type { ParseTask, ParsedRecord } from './indexWorker.js';
 import { isEmbeddingsEnabled } from './embeddings.js';
 import { generateMetadata, isLlmEnabled } from './llm.js';
@@ -275,7 +275,16 @@ export const IndexerService = {
     const effectiveOptions = { withEmbeddings, withAiMetadata };
 
     const watcher = chokidar.watch(folderPath, {
-      ignored: /(^|[\/\\])\../,
+      ignored: (filePath: string) => {
+        if (/(^|[\/\\])\../.test(filePath)) return true;
+        const parts = filePath.split(path.sep);
+        for (let i = 0; i < parts.length - 1; i++) {
+          if (shouldSkipDir(parts[i])) return true;
+        }
+        const basename = parts[parts.length - 1];
+        if (basename && shouldSkipFile(basename)) return true;
+        return false;
+      },
       persistent: true,
       ignoreInitial: true
     });

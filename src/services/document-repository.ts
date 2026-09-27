@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import { getDb, getDbPath, type FileMetadata, type SearchResult } from './database.js';
+import { normalizeTurkishForSearch, generateCleanSnippet } from './search.js';
 
 export interface IndexableChunk {
   chunkIndex: number;
@@ -90,16 +91,18 @@ export const DocumentRepository = {
         summary = COALESCE(?, summary),
         tags = COALESCE(?, tags),
         case_number = COALESCE(?, case_number),
+        case_kind = COALESCE(?, case_kind),
         court_name = COALESCE(?, court_name),
         document_type = COALESCE(?, document_type),
+        document_date = COALESCE(?, document_date),
         plaintiff = COALESCE(?, plaintiff),
         defendant = COALESCE(?, defendant),
         updated_at = ?
       WHERE file_id = ?
     `);
     const insertMetaStmt = database.prepare(`
-      INSERT INTO file_metadata (file_id, summary, tags, case_number, court_name, document_type, plaintiff, defendant, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO file_metadata (file_id, summary, tags, case_number, case_kind, court_name, document_type, document_date, plaintiff, defendant, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const delChunksStmt = database.prepare('DELETE FROM file_chunks WHERE file_id = ?');
@@ -150,7 +153,11 @@ export const DocumentRepository = {
 
         // FTS & Trigram virtual indexes
         insFtsStmt.run(fileId, doc.filename, body);
-        insTrigramStmt.run(fileId, doc.filename, body);
+        insTrigramStmt.run(
+          fileId,
+          normalizeTurkishForSearch(doc.filename),
+          normalizeTurkishForSearch(body)
+        );
 
         // Metadata
         if (doc.metadata) {
@@ -162,8 +169,10 @@ export const DocumentRepository = {
               meta.summary !== undefined ? meta.summary : null,
               tagsJson,
               meta.case_number !== undefined ? meta.case_number : null,
+              meta.case_kind !== undefined ? meta.case_kind : null,
               meta.court_name !== undefined ? meta.court_name : null,
               meta.document_type !== undefined ? meta.document_type : null,
+              meta.document_date !== undefined ? meta.document_date : null,
               meta.plaintiff !== undefined ? meta.plaintiff : null,
               meta.defendant !== undefined ? meta.defendant : null,
               now,
@@ -175,8 +184,10 @@ export const DocumentRepository = {
               meta.summary || null,
               tagsJson,
               meta.case_number || null,
+              meta.case_kind || null,
               meta.court_name || null,
               meta.document_type || null,
+              meta.document_date || null,
               meta.plaintiff || null,
               meta.defendant || null,
               now
@@ -213,7 +224,7 @@ export const DocumentRepository = {
 
     let metadata: FileMetadata | undefined;
     const metaRow = database
-      .prepare('SELECT summary, tags, case_number, court_name, document_type, plaintiff, defendant FROM file_metadata WHERE file_id = ?')
+      .prepare('SELECT summary, tags, case_number, case_kind, court_name, document_type, document_date, plaintiff, defendant FROM file_metadata WHERE file_id = ?')
       .get(row.id) as any;
 
     if (metaRow) {
@@ -229,8 +240,10 @@ export const DocumentRepository = {
         summary: metaRow.summary ? String(metaRow.summary) : undefined,
         tags,
         case_number: metaRow.case_number ? String(metaRow.case_number) : undefined,
+        case_kind: metaRow.case_kind ? String(metaRow.case_kind) : undefined,
         court_name: metaRow.court_name ? String(metaRow.court_name) : undefined,
         document_type: metaRow.document_type ? String(metaRow.document_type) : undefined,
+        document_date: metaRow.document_date ? String(metaRow.document_date) : undefined,
         plaintiff: metaRow.plaintiff ? String(metaRow.plaintiff) : undefined,
         defendant: metaRow.defendant ? String(metaRow.defendant) : undefined
       };
@@ -430,8 +443,10 @@ export const DocumentRepository = {
           summary = COALESCE(?, summary),
           tags = COALESCE(?, tags),
           case_number = COALESCE(?, case_number),
+          case_kind = COALESCE(?, case_kind),
           court_name = COALESCE(?, court_name),
           document_type = COALESCE(?, document_type),
+          document_date = COALESCE(?, document_date),
           plaintiff = COALESCE(?, plaintiff),
           defendant = COALESCE(?, defendant),
           updated_at = ?
@@ -440,8 +455,10 @@ export const DocumentRepository = {
         metadata.summary !== undefined ? metadata.summary : null,
         tagsJson,
         metadata.case_number !== undefined ? metadata.case_number : null,
+        metadata.case_kind !== undefined ? metadata.case_kind : null,
         metadata.court_name !== undefined ? metadata.court_name : null,
         metadata.document_type !== undefined ? metadata.document_type : null,
+        metadata.document_date !== undefined ? metadata.document_date : null,
         metadata.plaintiff !== undefined ? metadata.plaintiff : null,
         metadata.defendant !== undefined ? metadata.defendant : null,
         now,
@@ -449,15 +466,17 @@ export const DocumentRepository = {
       );
     } else {
       database.prepare(`
-        INSERT INTO file_metadata (file_id, summary, tags, case_number, court_name, document_type, plaintiff, defendant, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO file_metadata (file_id, summary, tags, case_number, case_kind, court_name, document_type, document_date, plaintiff, defendant, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         fileId,
         metadata.summary || null,
         tagsJson,
         metadata.case_number || null,
+        metadata.case_kind || null,
         metadata.court_name || null,
         metadata.document_type || null,
+        metadata.document_date || null,
         metadata.plaintiff || null,
         metadata.defendant || null,
         now
@@ -518,26 +537,34 @@ export const DocumentRepository = {
   queryTrigram(cleanQuery: string, limit = 50): SearchRetrieverItem[] {
     const database = getDb();
     try {
+      const normalizedQuery = normalizeTurkishForSearch(cleanQuery);
       const rows = database.prepare(`
         SELECT 
           f.id,
           f.path,
           f.filename,
-          snippet(files_trigram, 1, '<b>', '</b>', '...', 25) as snippet,
+          f.body,
+          snippet(files_trigram, 1, '<b>', '</b>', '...', 25) as raw_snippet,
           bm25(files_trigram) as rank
         FROM files_trigram
         JOIN files f ON f.id = files_trigram.rowid
         WHERE files_trigram MATCH ?
         ORDER BY rank LIMIT ?
-      `).all(`"${cleanQuery}"`, limit) as any[];
+      `).all(`"${normalizedQuery}"`, limit) as any[];
 
-      return rows.map((r) => ({
-        id: Number(r.id),
-        path: String(r.path),
-        filename: String(r.filename),
-        snippet: String(r.snippet),
-        score: -Number(r.rank)
-      }));
+      return rows.map((r) => {
+        const bodyText = r.body ? String(r.body) : '';
+        const cleanSnippet = bodyText
+          ? generateCleanSnippet(bodyText, cleanQuery, 180)
+          : '';
+        return {
+          id: Number(r.id),
+          path: String(r.path),
+          filename: String(r.filename),
+          snippet: cleanSnippet || String(r.raw_snippet || r.filename),
+          score: -Number(r.rank)
+        };
+      });
     } catch (err) {
       console.error('Trigram infix query search failed:', err);
       return [];
@@ -587,8 +614,10 @@ export const DocumentRepository = {
           m.summary,
           m.tags,
           m.case_number,
+          m.case_kind,
           m.court_name,
           m.document_type,
+          m.document_date,
           m.plaintiff,
           m.defendant
         FROM file_metadata m
@@ -610,8 +639,10 @@ export const DocumentRepository = {
           summary: row.summary ? String(row.summary) : undefined,
           tags,
           case_number: row.case_number ? String(row.case_number) : undefined,
+          case_kind: row.case_kind ? String(row.case_kind) : undefined,
           court_name: row.court_name ? String(row.court_name) : undefined,
           document_type: row.document_type ? String(row.document_type) : undefined,
+          document_date: row.document_date ? String(row.document_date) : undefined,
           plaintiff: row.plaintiff ? String(row.plaintiff) : undefined,
           defendant: row.defendant ? String(row.defendant) : undefined
         });

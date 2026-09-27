@@ -23,3 +23,15 @@ implement analytics, logging etc maybe even history
 searching precedents inside the app
 add the other mcps
 add the chat ui
+
+## Ideas & Features from MetinBul Analysis (Future Considerations)
+- **macOS Cloud Placeholder (`SF_DATALESS`) Detection via batch `/usr/bin/stat`**:
+  - Node.js `fs.stat()` does not return BSD file flags on macOS (`flags` is undefined).
+  - Adopt MetinBul's chunked child_process call (`execFile('/usr/bin/stat', ['-L', '-f', '%@:%#Xf', ...])` in 200-file batches) in `walker.ts` to reliably detect and skip dataless placeholders on iCloud Drive, OneDrive Files On-Demand, and Google Drive without native C++ addons.
+- **Search Roots Auto-Discovery (`buluver folder suggest` / setup wizard auto-discovery)**:
+  - Add automatic detection of standard legal archive locations:
+    - `~/Library/Mobile Documents/com~apple~CloudDocs` (macOS iCloud Drive)
+    - `~/Library/CloudStorage/*` (Google Drive Desktop, OneDrive)
+    - `/Volumes/*` (External USB flash drives, external HDDs/SSDs)
+- [x] **Extended Directory Exclusions** (Completed):
+  - Expanded `SKIP_DIRS` and added `shouldSkipDir()` in `walker.ts` and `indexer.ts` (chokidar watcher) to automatically skip `.venv`, `venv`, `env`, `.cargo`, `.rustup`, `.cache`, `caches`, `Application Support`, `Containers`, `logs`, `applications`, and `.app` bundles.
