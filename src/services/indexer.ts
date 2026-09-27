@@ -5,15 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { FolderStore } from './folder-store.js';
-import {
-  DocumentRepository,
-  type IndexableDocument,
-  type IndexableChunk
-} from './document-repository.js';
+import { DocumentRepository } from './document-repository.js';
 import { DocumentParser } from './doc-parser.js';
+import { DocumentIngestor } from './document-ingestor.js';
 import { walk } from './walker.js';
 import type { ParseTask, ParsedRecord } from './indexWorker.js';
-import { generateEmbedding, chunkText, isEmbeddingsEnabled } from './embeddings.js';
+import { isEmbeddingsEnabled } from './embeddings.js';
 import { generateMetadata, isLlmEnabled } from './llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -171,68 +168,18 @@ export const IndexerService = {
         const currentBatch = pendingBatch;
         pendingBatch = [];
 
-        const completeDocs: IndexableDocument[] = [];
+        try {
+          const completeDocs = await DocumentIngestor.ingestBatch(currentBatch, {
+            withEmbeddings: effectiveOptions.withEmbeddings,
+            withAiMetadata: effectiveOptions.withAiMetadata
+          });
 
-        for (const item of currentBatch) {
-          try {
-            const body = item.body ?? '';
-            // 1. Fast regex heuristics parse
-            const heuristicMeta = DocumentParser.extractMetadataHeuristics(body, item.filename);
-
-            // 2. Optional AI metadata generation
-            let finalMeta = heuristicMeta;
-            if (effectiveOptions.withAiMetadata && body.trim().length > 50) {
-              try {
-                const aiMeta = await generateMetadata(body);
-                finalMeta = {
-                  ...heuristicMeta,
-                  summary: aiMeta.summary,
-                  tags: aiMeta.tags,
-                };
-              } catch (aiErr) {
-                console.error(`[AI] Metadata generation failed for ${item.path}:`, aiErr);
-              }
-            }
-
-            // 3. Optional local embeddings generation
-            let chunkData: IndexableChunk[] | undefined;
-            if (effectiveOptions.withEmbeddings && body.trim().length > 0) {
-              const chunks = chunkText(body);
-              if (chunks.length > 0) {
-                chunkData = [];
-                for (let i = 0; i < chunks.length; i++) {
-                  try {
-                    const embedding = await generateEmbedding(chunks[i]);
-                    chunkData.push({
-                      chunkIndex: i,
-                      text: chunks[i],
-                      embedding
-                    });
-                  } catch (embErr) {
-                    console.error(`[Embedding] Failed on chunk ${i} of ${item.path}:`, embErr);
-                  }
-                }
-              }
-            }
-
-            completeDocs.push({
-              path: item.path,
-              filename: item.filename,
-              extension: item.ext,
-              mtime: item.mtimeMs,
-              size: item.size,
-              body,
-              metadata: finalMeta,
-              chunks: chunkData
-            });
-          } catch (err) {
-            console.error(`Enrichment failed for file ${item.path}:`, err);
+          if (completeDocs.length > 0) {
+            DocumentRepository.saveDocumentsBatch(completeDocs);
+            totalParsed += completeDocs.length;
           }
-        }
-
-        if (completeDocs.length > 0) {
-          DocumentRepository.saveDocumentsBatch(completeDocs);
-          totalParsed += completeDocs.length;
+        } catch (err) {
+          console.error('[Indexer] Batch ingestion failed:', err);
         }
 
         throttleEmit(
@@ -340,61 +287,20 @@ export const IndexerService = {
         const stats = fs.statSync(filePath);
         if (stats.size === 0) return;
 
-        const body = await DocumentParser.parse(filePath);
-        const ext = path.extname(filePath).toLowerCase();
-        const filename = path.basename(filePath);
-
-        let finalMeta: any;
-        let chunkData: IndexableChunk[] | undefined;
-
-        if (body) {
-          const heuristicMeta = DocumentParser.extractMetadataHeuristics(body, filename);
-          finalMeta = heuristicMeta;
-          if (effectiveOptions.withAiMetadata && body.trim().length > 50) {
-            try {
-              const aiMeta = await generateMetadata(body);
-              finalMeta = {
-                ...heuristicMeta,
-                summary: aiMeta.summary,
-                tags: aiMeta.tags,
-              };
-            } catch (aiErr) {
-              console.error(`[AI] Metadata generation failed for ${filePath}:`, aiErr);
-            }
+        const completeDoc = await DocumentIngestor.ingest(
+          {
+            path: filePath,
+            mtimeMs: Math.floor(stats.mtimeMs),
+            size: stats.size
+          },
+          {
+            withEmbeddings: effectiveOptions.withEmbeddings,
+            withAiMetadata: effectiveOptions.withAiMetadata
           }
+        );
 
-          if (effectiveOptions.withEmbeddings && body.trim().length > 0) {
-            const chunks = chunkText(body);
-            if (chunks.length > 0) {
-              chunkData = [];
-              for (let i = 0; i < chunks.length; i++) {
-                try {
-                  const embedding = await generateEmbedding(chunks[i]);
-                  chunkData.push({
-                    chunkIndex: i,
-                    text: chunks[i],
-                    embedding
-                  });
-                } catch (err) {
-                  console.error(`[Embedding] Failed on chunk ${i} of ${filePath}:`, err);
-                }
-              }
-            }
-          }
-        }
-
-        DocumentRepository.saveDocument({
-          path: filePath,
-          filename,
-          extension: ext,
-          mtime: stats.mtimeMs,
-          size: stats.size,
-          body,
-          metadata: finalMeta,
-          chunks: chunkData
-        });
-
-        this.emitStatus(`Dosya güncellendi: ${filename}`, 100);
+        DocumentRepository.saveDocument(completeDoc);
+        this.emitStatus(`Dosya güncellendi: ${completeDoc.filename}`, 100);
       } catch (err) {
         console.error(`Watcher failed to index ${filePath}:`, err);
       }

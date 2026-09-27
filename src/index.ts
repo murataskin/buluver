@@ -1,11 +1,11 @@
 export {
-  DatabaseService,
   DocumentRepository,
   FolderStore,
   SettingsStore,
   getDb,
   getDbPath,
-  getDataDir
+  getDataDir,
+  resetDatabase
 } from './services/database.js';
 export type {
   FileRecord,
@@ -19,6 +19,8 @@ export type {
 } from './services/database.js';
 export { DocumentParser } from './services/doc-parser.js';
 export type { DocumentMetadata } from './services/doc-parser.js';
+export { DocumentIngestor } from './services/document-ingestor.js';
+export type { IngestTask, IngestionOptions, IngestedDocumentPayload } from './services/document-ingestor.js';
 export { SearchEngine, createSearchEngine, parseSearchQuery } from './services/search.js';
 export type { SearchMode, SearchOptions, SearchResponse } from './services/search.js';
 export { IndexerService } from './services/indexer.js';

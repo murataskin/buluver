@@ -28,6 +28,9 @@ The unified retrieval module executing Search Queries. It encapsulates query syn
 ### Document Repository
 The persistence boundary encapsulating document storage, full-text indexes (BM25 and Trigram), legal metadata, and chunk embeddings. It guarantees atomic multi-table writes during sync operations, abstracts SQLite internal tables, and prevents foreign key leakage to callers.
 
+### Document Ingestor
+The deep ingestion module transforming a raw filesystem file or buffer into an atomic, indexable document record. It encapsulates multi-format text extraction (UDF, DOCX, DOC, PDF, TXT), Turkish legal heuristic parsing (court names, case/esas numbers, parties), optional AI metadata/summary synthesis, and text chunking with vector embedding generation.
+
 ### Folder Store
 The persistence boundary managing registered Monitored Folders, their registration timestamps, and folder-level deletion cascades.
 

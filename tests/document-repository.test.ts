@@ -12,8 +12,7 @@ process.env.BULUVER_DB_PATH = path.join(tmpDir, 'test.db');
 const {
   DocumentRepository,
   FolderStore,
-  SettingsStore,
-  DatabaseService
+  SettingsStore
 } = await import('../src/services/database.js');
 
 describe('SettingsStore', () => {

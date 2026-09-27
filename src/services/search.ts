@@ -1,4 +1,4 @@
-import { DatabaseService, type SearchResult, type FileMetadata } from './database.js';
+import { type SearchResult, type FileMetadata } from './database.js';
 import { generateEmbedding, isEmbeddingsEnabled } from './embeddings.js';
 
 export type SearchMode = 'keyword' | 'semantic' | 'hybrid' | 'infix';
