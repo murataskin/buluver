@@ -125,15 +125,38 @@ export class DocumentParser {
   }
 
   /**
-   * Parses Adobe PDF (.pdf) documents using pdf-parse
+   * Parses Adobe PDF (.pdf) documents using pdf-parse, silencing benign
+   * PDF.js internal warnings (such as TT font bytecode hinting or missing glyf recovery).
    */
   static async parsePdf(filePath: string): Promise<string> {
+    const origLog = console.log;
+    const origWarn = console.warn;
+
+    const filter = (...args: any[]) => {
+      const msg = args.map(a => typeof a === 'string' ? a : (a?.message || '')).join(' ');
+      if (
+        msg.startsWith('Warning: TT:') ||
+        msg.includes('Required "glyf" table is not found') ||
+        msg.includes('Indexing all PDF objects') ||
+        msg.startsWith('Warning: Indexing all PDF objects')
+      ) {
+        return; // Suppress benign font bytecode / recovery warnings from PDF.js
+      }
+      origLog.apply(console, args);
+    };
+
     try {
+      console.log = filter;
+      console.warn = filter;
+
       const dataBuffer = await fsPromises.readFile(filePath);
       const data = await pdfParse(dataBuffer);
       return this.cleanText(data.text);
     } catch (err: any) {
       throw new Error(`PDF ayrıştırma hatası (${path.basename(filePath)}): ${err?.message || err}`);
+    } finally {
+      console.log = origLog;
+      console.warn = origWarn;
     }
   }
 

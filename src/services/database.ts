@@ -2,6 +2,9 @@ import { DatabaseSync } from 'node:sqlite';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import { FolderStore } from './folder-store.js';
+import { SettingsStore } from './settings-store.js';
+import { DocumentRepository } from './document-repository.js';
 
 export function getDataDir(): string {
   const custom = process.env.BULUVER_DATA_DIR;
@@ -174,38 +177,17 @@ export interface SearchResult {
 }
 
 export const DatabaseService = {
-  // Folder Operations
+  // Folder Operations (delegated to FolderStore)
   getFolders(): FolderRecord[] {
-    const database = getDb();
-    return database.prepare('SELECT path, added_at FROM folders ORDER BY added_at ASC').all() as unknown as FolderRecord[];
+    return FolderStore.getFolders();
   },
 
   addFolder(folderPath: string): void {
-    const database = getDb();
-    database.prepare('INSERT OR IGNORE INTO folders (path, added_at) VALUES (?, ?)').run(folderPath, Date.now());
+    FolderStore.addFolder(folderPath);
   },
 
   removeFolder(folderPath: string): void {
-    const database = getDb();
-    const like = folderPath.endsWith(path.sep) ? folderPath : folderPath + path.sep;
-    const rows = database.prepare(`SELECT id FROM files WHERE path LIKE ? || '%'`).all(like) as unknown as { id: number }[];
-    
-    database.exec('BEGIN IMMEDIATE;');
-    try {
-      const delFile = database.prepare('DELETE FROM files WHERE id = ?');
-      const delFts = database.prepare('DELETE FROM files_fts WHERE rowid = ?');
-      const delTrigram = database.prepare('DELETE FROM files_trigram WHERE rowid = ?');
-      for (const r of rows) {
-        delFts.run(r.id);
-        delTrigram.run(r.id);
-        delFile.run(r.id);
-      }
-      database.prepare('DELETE FROM folders WHERE path = ?').run(folderPath);
-      database.exec('COMMIT;');
-    } catch (err) {
-      database.exec('ROLLBACK;');
-      throw err;
-    }
+    FolderStore.removeFolder(folderPath);
   },
 
   // File Operations
@@ -248,33 +230,15 @@ export const DatabaseService = {
     totalChunks: number;
     dbPath: string;
   } {
-    const database = getDb();
-    const foldersCount = Number((database.prepare('SELECT COUNT(*) as count FROM folders').get() as any)?.count || 0);
-    const filesCount = Number((database.prepare('SELECT COUNT(*) as count FROM files').get() as any)?.count || 0);
-    const indexedCount = Number((database.prepare("SELECT COUNT(*) as count FROM files WHERE status = 'indexed'").get() as any)?.count || 0);
-    const chunksCount = Number((database.prepare('SELECT COUNT(*) as count FROM file_chunks').get() as any)?.count || 0);
-    return {
-      monitoredFolders: foldersCount,
-      totalFiles: filesCount,
-      indexedFiles: indexedCount,
-      totalChunks: chunksCount,
-      dbPath: getDbPath(),
-    };
+    return DocumentRepository.getStats();
   },
 
-  getSetting(key: string, defaultValue: string): string {
-    const database = getDb();
-    try {
-      const row = database.prepare('SELECT value FROM app_settings WHERE key = ?').get(key) as any;
-      return row ? String(row.value) : defaultValue;
-    } catch {
-      return defaultValue;
-    }
+  getSetting(key: string, defaultValue = ''): string {
+    return SettingsStore.get(key, defaultValue);
   },
 
   setSetting(key: string, value: string): void {
-    const database = getDb();
-    database.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)').run(key, value);
+    SettingsStore.set(key, value);
   },
 
   getFilesWithoutSummary(): { id: number; path: string; filename: string }[] {
@@ -487,137 +451,7 @@ export const DatabaseService = {
     return map;
   },
 
-  parseSearchQuery(query: string): string {
-    let quoteCount = (query.match(/"/g) || []).length;
-    if (quoteCount % 2 !== 0) {
-      query += '"';
-    }
 
-    const tokenRegex = /(-?"[^"]+")|(-?[^\s"()]+)|(OR|AND|NOT|\(|\))/gi;
-    const tokens: string[] = [];
-    let match;
-    while ((match = tokenRegex.exec(query)) !== null) {
-      tokens.push(match[0]);
-    }
-
-    if (tokens.length === 0) return '';
-
-    const parsedTokens: string[] = [];
-    
-    for (let i = 0; i < tokens.length; i++) {
-      const token = tokens[i];
-      const upperToken = token.toUpperCase();
-
-      if (upperToken === 'OR' || upperToken === 'AND' || upperToken === 'NOT') {
-        if (parsedTokens.length === 0) continue;
-        const lastToken = parsedTokens[parsedTokens.length - 1].toUpperCase();
-        if (lastToken === 'AND' || lastToken === 'OR' || lastToken === 'NOT') {
-          continue;
-        }
-        parsedTokens.push(upperToken);
-      } else if (token === '(' || token === ')') {
-        parsedTokens.push(token);
-      } else {
-        if (token.startsWith('-')) {
-          const actualTerm = token.slice(1);
-          if (actualTerm.length > 0) {
-            if (parsedTokens.length > 0) {
-              const lastToken = parsedTokens[parsedTokens.length - 1].toUpperCase();
-              if (lastToken !== 'NOT' && lastToken !== 'AND' && lastToken !== 'OR') {
-                parsedTokens.push('NOT');
-              }
-            } else {
-              parsedTokens.push('NOT');
-            }
-            
-            if (actualTerm.startsWith('"')) {
-              parsedTokens.push(actualTerm);
-            } else {
-              parsedTokens.push(actualTerm.endsWith('*') ? actualTerm : `${actualTerm}*`);
-            }
-          }
-        } else {
-          let formattedTerm = token;
-          if (!token.startsWith('"')) {
-            formattedTerm = token.endsWith('*') ? token : `${token}*`;
-          }
-          
-          if (parsedTokens.length > 0) {
-            const lastToken = parsedTokens[parsedTokens.length - 1];
-            const lastUpper = lastToken.toUpperCase();
-            if (
-              lastToken !== '(' &&
-              lastUpper !== 'AND' &&
-              lastUpper !== 'OR' &&
-              lastUpper !== 'NOT'
-            ) {
-              parsedTokens.push('AND');
-            }
-          }
-          parsedTokens.push(formattedTerm);
-        }
-      }
-    }
-
-    while (parsedTokens.length > 0) {
-      const last = parsedTokens[parsedTokens.length - 1].toUpperCase();
-      if (last === 'AND' || last === 'OR' || last === 'NOT') {
-        parsedTokens.pop();
-      } else {
-        break;
-      }
-    }
-
-    let openCount = 0;
-    const balancedTokens: string[] = [];
-    for (const token of parsedTokens) {
-      if (token === '(') {
-        openCount++;
-        balancedTokens.push(token);
-      } else if (token === ')') {
-        if (openCount > 0) {
-          openCount--;
-          balancedTokens.push(token);
-        }
-      } else {
-        balancedTokens.push(token);
-      }
-    }
-    while (openCount > 0) {
-      balancedTokens.push(')');
-      openCount--;
-    }
-
-    return balancedTokens.join(' ');
-  },
-
-  searchContent(query: string): SearchResult[] {
-    const database = getDb();
-    const ftsQuery = this.parseSearchQuery(query);
-
-    if (!ftsQuery) return [];
-
-    try {
-      const rows = database.prepare(`
-        SELECT 
-          f.path,
-          f.filename,
-          snippet(files_fts, 1, '<b>', '</b>', '...', 25) as snippet
-        FROM files_fts
-        JOIN files f ON f.id = files_fts.rowid
-        WHERE files_fts MATCH ?
-        ORDER BY rank LIMIT 50
-      `).all(ftsQuery) as any[];
-      return rows.map(r => ({
-        path: String(r.path),
-        filename: String(r.filename),
-        snippet: String(r.snippet)
-      }));
-    } catch (err) {
-      console.error('FTS5 query search failed:', err, 'Query was:', ftsQuery);
-      return [];
-    }
-  },
 
   upsertFileMetadata(fileId: number, metadata: Partial<FileMetadata>): void {
     const database = getDb();
@@ -735,13 +569,36 @@ export const DatabaseService = {
     }
   },
 
-  searchInfix(query: string, limit = 50): SearchResult[] {
+  queryFts(ftsQuery: string, limit = 50): { id: number; path: string; filename: string; snippet: string; score: number }[] {
     const database = getDb();
-    const clean = query.trim().replace(/["']/g, '');
-    if (clean.length < 3) {
+    try {
+      const rows = database.prepare(`
+        SELECT 
+          f.id,
+          f.path,
+          f.filename,
+          snippet(files_fts, 1, '<b>', '</b>', '...', 25) as snippet,
+          rank
+        FROM files_fts
+        JOIN files f ON f.id = files_fts.rowid
+        WHERE files_fts MATCH ?
+        ORDER BY rank LIMIT ?
+      `).all(ftsQuery, limit) as any[];
+      return rows.map(r => ({
+        id: Number(r.id),
+        path: String(r.path),
+        filename: String(r.filename),
+        snippet: String(r.snippet),
+        score: -Number(r.rank)
+      }));
+    } catch (err) {
+      console.error('FTS5 query search failed:', err, 'Query was:', ftsQuery);
       return [];
     }
+  },
 
+  queryTrigram(cleanQuery: string, limit = 50): { id: number; path: string; filename: string; snippet: string; score: number }[] {
+    const database = getDb();
     try {
       const rows = database.prepare(`
         SELECT 
@@ -754,168 +611,49 @@ export const DatabaseService = {
         JOIN files f ON f.id = files_trigram.rowid
         WHERE files_trigram MATCH ?
         ORDER BY rank LIMIT ?
-      `).all(`"${clean}"`, limit) as any[];
+      `).all(`"${cleanQuery}"`, limit) as any[];
 
-      const results: SearchResult[] = rows.map(r => ({
+      return rows.map(r => ({
+        id: Number(r.id),
         path: String(r.path),
         filename: String(r.filename),
         snippet: String(r.snippet),
-        score: -Number(r.rank),
-        mode: 'infix'
+        score: -Number(r.rank)
       }));
-
-      this.attachMetadataToResults(results);
-      return results;
     } catch (err) {
       console.error('Trigram infix query search failed:', err);
       return [];
     }
   },
 
-  search(query: string, mode: 'keyword' | 'semantic' | 'hybrid' | 'infix' = 'keyword', queryEmbedding?: Float32Array, limit = 50): SearchResult[] {
+  queryVector(buffer: Buffer, limit = 50): { id: number; path: string; filename: string; snippet: string; score: number }[] {
     const database = getDb();
-
-    if (mode === 'infix') {
-      return this.searchInfix(query, limit);
-    }
-    
-    // 1. Keyword search (FTS5)
-    let ftsResults: { id: number; path: string; filename: string; snippet: string; rank: number }[] = [];
-    const ftsQuery = this.parseSearchQuery(query);
-    if (ftsQuery && (mode === 'keyword' || mode === 'hybrid')) {
-      try {
-        const rows = database.prepare(`
-          SELECT 
-            f.id,
-            f.path,
-            f.filename,
-            snippet(files_fts, 1, '<b>', '</b>', '...', 25) as snippet,
-            rank
-          FROM files_fts
-          JOIN files f ON f.id = files_fts.rowid
-          WHERE files_fts MATCH ?
-          ORDER BY rank LIMIT ?
-        `).all(ftsQuery, limit * 2) as any[];
-        ftsResults = rows.map(r => ({
-          id: Number(r.id),
-          path: String(r.path),
-          filename: String(r.filename),
-          snippet: String(r.snippet),
-          rank: Number(r.rank)
-        }));
-      } catch (err) {
-        console.error('FTS5 query search failed:', err, 'Query was:', ftsQuery);
-      }
-    }
-
-    // 2. Semantic search
-    let semanticResults: { id: number; path: string; filename: string; snippet: string; similarity: number }[] = [];
-    if (queryEmbedding && (mode === 'semantic' || mode === 'hybrid')) {
-      try {
-        const buffer = Buffer.from(queryEmbedding.buffer, queryEmbedding.byteOffset, queryEmbedding.byteLength);
-        const rows = database.prepare(`
-          SELECT 
-            f.id,
-            f.path,
-            f.filename,
-            fc.text as snippet,
-            MAX(cosine_similarity(fc.embedding, ?)) as similarity
-          FROM file_chunks fc
-          JOIN files f ON f.id = fc.file_id
-          GROUP BY f.id
-          HAVING similarity > 0.1
-          ORDER BY similarity DESC
-          LIMIT ?
-        `).all(buffer, limit * 2) as any[];
-        semanticResults = rows.map(r => ({
-          id: Number(r.id),
-          path: String(r.path),
-          filename: String(r.filename),
-          snippet: String(r.snippet),
-          similarity: Number(r.similarity)
-        }));
-      } catch (err) {
-        console.error('Semantic query search failed:', err);
-      }
-    }
-
-    // 3. Merging / Selecting results based on mode
-    let merged: SearchResult[] = [];
-
-    if (mode === 'keyword') {
-      merged = ftsResults.map(r => ({
-        path: r.path,
-        filename: r.filename,
-        snippet: r.snippet,
-        score: -r.rank,
-        mode: 'keyword'
+    try {
+      const rows = database.prepare(`
+        SELECT 
+          f.id,
+          f.path,
+          f.filename,
+          fc.text as snippet,
+          MAX(cosine_similarity(fc.embedding, ?)) as similarity
+        FROM file_chunks fc
+        JOIN files f ON f.id = fc.file_id
+        GROUP BY f.id
+        HAVING similarity > 0.1
+        ORDER BY similarity DESC
+        LIMIT ?
+      `).all(buffer, limit) as any[];
+      return rows.map(r => ({
+        id: Number(r.id),
+        path: String(r.path),
+        filename: String(r.filename),
+        snippet: String(r.snippet),
+        score: Number(r.similarity)
       }));
-    } else if (mode === 'semantic') {
-      merged = semanticResults.map(r => ({
-        path: r.path,
-        filename: r.filename,
-        snippet: r.snippet,
-        score: r.similarity,
-        mode: 'semantic'
-      }));
-    } else {
-      // Hybrid mode: Reciprocal Rank Fusion (RRF)
-      const ftsRankMap = new Map<number, number>();
-      ftsResults.forEach((r, idx) => ftsRankMap.set(r.id, idx + 1));
-
-      const semRankMap = new Map<number, number>();
-      semanticResults.forEach((r, idx) => semRankMap.set(r.id, idx + 1));
-
-      const allIds = new Set<number>([
-        ...ftsResults.map(r => r.id),
-        ...semanticResults.map(r => r.id)
-      ]);
-
-      const rrfResults: { id: number; path: string; filename: string; snippet: string; score: number }[] = [];
-
-      for (const id of allIds) {
-        const ftsRank = ftsRankMap.get(id);
-        const semRank = semRankMap.get(id);
-
-        const rrfFts = ftsRank ? (1 / (60 + ftsRank)) : 0;
-        const rrfSem = semRank ? (1 / (60 + semRank)) : 0;
-        const score = rrfFts + rrfSem;
-
-        let snippet = '';
-        const ftsItem = ftsResults.find(r => r.id === id);
-        const semItem = semanticResults.find(r => r.id === id);
-
-        if (ftsItem && ftsItem.snippet) {
-          snippet = ftsItem.snippet;
-        } else if (semItem && semItem.snippet) {
-          snippet = semItem.snippet;
-        }
-
-        const item = ftsItem || semItem;
-        if (item) {
-          rrfResults.push({
-            id,
-            path: item.path,
-            filename: item.filename,
-            snippet,
-            score
-          });
-        }
-      }
-
-      rrfResults.sort((a, b) => b.score - a.score);
-      merged = rrfResults.map(r => ({
-        path: r.path,
-        filename: r.filename,
-        snippet: r.snippet,
-        score: r.score,
-        mode: 'hybrid'
-      }));
+    } catch (err) {
+      console.error('Semantic query search failed:', err);
+      return [];
     }
-
-    const finalResults = merged.slice(0, limit);
-    this.attachMetadataToResults(finalResults);
-    return finalResults;
   },
 
   resetDatabase(): void {
@@ -937,3 +675,14 @@ export const DatabaseService = {
     getDb();
   }
 };
+
+export { FolderStore } from './folder-store.js';
+export { SettingsStore } from './settings-store.js';
+export { DocumentRepository } from './document-repository.js';
+export type {
+  IndexableDocument,
+  IndexableChunk,
+  DocumentRecord,
+  RepositoryStats,
+  SearchRetrieverItem
+} from './document-repository.js';

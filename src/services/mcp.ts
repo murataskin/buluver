@@ -1,15 +1,16 @@
 import { FastMCP } from 'fastmcp';
 import { z } from 'zod';
-import { DatabaseService, getDbPath } from './database.js';
+import { FolderStore, DocumentRepository, getDbPath } from './database.js';
 import { IndexerService } from './indexer.js';
 import { DocumentParser } from './doc-parser.js';
+import { SearchEngine, type SearchMode } from './search.js';
 import {
-  generateEmbedding,
   getActiveEmbeddingModel,
   setActiveEmbeddingModel,
   getChunkSettings,
   setChunkSettings,
-  rebuildAllEmbeddings
+  rebuildAllEmbeddings,
+  generateMissingEmbeddings
 } from './embeddings.js';
 import {
   getLLMSettings,
@@ -43,23 +44,11 @@ export const McpServerService = {
       }),
       execute: async ({ query, mode = 'keyword', limit = 20 }) => {
         try {
-          const effectiveMode = (mode === 'trigram' ? 'infix' : mode) as 'keyword' | 'semantic' | 'hybrid' | 'infix';
-          let queryEmbedding: Float32Array | undefined;
-          if (effectiveMode === 'semantic' || effectiveMode === 'hybrid') {
-            try {
-              queryEmbedding = await generateEmbedding(query);
-            } catch (err) {
-              console.error('[MCP] Vektör oluşturulamadı, keyword moduna düşülüyor:', err);
-            }
-          }
-
-          const results = DatabaseService.search(query, effectiveMode, queryEmbedding, limit);
+          const requestedMode = (mode === 'trigram' ? 'infix' : mode) as SearchMode;
+          const response = await SearchEngine.search(query, { mode: requestedMode, limit });
           return JSON.stringify({
             success: true,
-            query,
-            mode: effectiveMode,
-            count: results.length,
-            results
+            ...response
           }, null, 2);
         } catch (err: any) {
           return JSON.stringify({
@@ -113,8 +102,8 @@ export const McpServerService = {
       parameters: z.object({}),
       execute: async () => {
         try {
-          const stats = DatabaseService.getStats();
-          const folders = DatabaseService.getFolders().map(f => f.path);
+          const stats = DocumentRepository.getStats();
+          const folders = FolderStore.getFolders().map(f => f.path);
           const llm = getLLMSettings();
           const activeModel = getActiveEmbeddingModel();
           const chunking = getChunkSettings();
@@ -152,7 +141,7 @@ export const McpServerService = {
           const llm = getLLMSettings();
           const activeEmbeddingModel = getActiveEmbeddingModel();
           const chunkSettings = getChunkSettings();
-          const stats = DatabaseService.getStats();
+          const stats = DocumentRepository.getStats();
 
           return JSON.stringify({
             success: true,
@@ -314,16 +303,26 @@ export const McpServerService = {
             throw new Error(`Klasör mevcut değil: ${folderPath}`);
           }
 
-          DatabaseService.addFolder(folderPath);
+          const addRes = FolderStore.addFolder(folderPath);
           IndexerService.startWatchingFolder(folderPath);
 
           if (scanNow) {
             IndexerService.scanAllRegisteredFolders().catch(console.error);
           }
 
+          let message = `Klasör başarıyla eklendi: ${folderPath}`;
+          if (!addRes.added) {
+            message = addRes.parentPath
+              ? `Klasör zaten üst dizin üzerinden izleniyor: ${addRes.parentPath}`
+              : `Klasör zaten izleme listesinde: ${folderPath}`;
+          } else if (addRes.prunedChildren && addRes.prunedChildren.length > 0) {
+            message += ` (${addRes.prunedChildren.length} alt klasör kaydı bu üst dizinle birleştirildi)`;
+          }
+
           return JSON.stringify({
             success: true,
-            message: `Klasör başarıyla eklendi: ${folderPath}`,
+            message,
+            added: addRes.added,
             scanning: scanNow
           });
         } catch (err: any) {
@@ -338,17 +337,20 @@ export const McpServerService = {
     // 9. Remove folder tool
     s.addTool({
       name: 'remove_folder',
-      description: 'İzlenen bir klasörü ve o klasöre ait indekslenmiş belgeleri dizinden siler.',
+      description: 'İzlenen bir klasörü dizinden kaldırır. keepFiles seçeneği true verildiğinde belgeler ve vektörler silinmez (güvenli unwatch).',
       parameters: z.object({
-        folderPath: z.string().describe('Silinecek klasörün mutlak yolu')
+        folderPath: z.string().describe('Silinecek klasörün mutlak yolu'),
+        keepFiles: z.boolean().optional().default(false).describe('İndekslenmiş belgeleri ve vektörleri silmeden yalnızca klasör izleme kaydını kaldır (güvenli kaldırma)')
       }),
-      execute: async ({ folderPath }) => {
+      execute: async ({ folderPath, keepFiles = false }) => {
         try {
           IndexerService.stopWatchingFolder(folderPath);
-          DatabaseService.removeFolder(folderPath);
+          FolderStore.removeFolder(folderPath, { keepFiles });
           return JSON.stringify({
             success: true,
-            message: `Klasör ve ilişkili belgeler dizinden kaldırıldı: ${folderPath}`
+            message: keepFiles
+              ? `Klasör izleme listesinden kaldırıldı (indekslenen belgeler ve vektörler korundu): ${folderPath}`
+              : `Klasör ve ilişkili belgeler dizinden kaldırıldı: ${folderPath}`
           });
         } catch (err: any) {
           return JSON.stringify({
@@ -359,7 +361,31 @@ export const McpServerService = {
       }
     });
 
-    // 10. Trigger scan tool
+    // 10. Generate missing embeddings tool
+    s.addTool({
+      name: 'generate_embeddings',
+      description: 'Henüz vektör embeddingi oluşturulmamış belgeler için toplu veya sınırlı sayıda embedding üretir.',
+      parameters: z.object({
+        limit: z.number().optional().describe('İşlenecek maksimum belge sayısı (boş bırakılırsa tüm eksik belgeler işlenir)')
+      }),
+      execute: async ({ limit }) => {
+        try {
+          const res = await generateMissingEmbeddings({ limit });
+          return JSON.stringify({
+            success: true,
+            message: `${res.totalFiles} belge için ${res.totalChunks} vektör chunk oluşturuldu.`,
+            ...res
+          }, null, 2);
+        } catch (err: any) {
+          return JSON.stringify({
+            success: false,
+            error: err?.message || String(err)
+          });
+        }
+      }
+    });
+
+    // 11. Trigger scan tool
     s.addTool({
       name: 'trigger_scan',
       description: 'Kayıtlı tüm klasörleri tarayarak yeni ve değişen belgeleri dizine ekler.',
@@ -406,12 +432,7 @@ export const McpServerService = {
       }),
       execute: async ({ filePath, summary, tags, case_number, court_name, document_type, plaintiff, defendant }) => {
         try {
-          const file = DatabaseService.getFile(filePath);
-          if (!file || file.id === undefined) {
-            throw new Error(`Dosya veritabanında bulunamadı: ${filePath}`);
-          }
-
-          DatabaseService.upsertFileMetadata(file.id, {
+          DocumentRepository.updateMetadata(filePath, {
             summary,
             tags,
             case_number,

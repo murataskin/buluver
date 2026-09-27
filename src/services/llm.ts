@@ -1,4 +1,4 @@
-import { DatabaseService } from './database.js';
+import { SettingsStore } from './settings-store.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider types & config helpers
@@ -13,20 +13,28 @@ export interface LLMSettings {
   baseUrl: string;
 }
 
+export function isLlmEnabled(): boolean {
+  return SettingsStore.get('llm_enabled', 'false') === 'true';
+}
+
+export function setLlmEnabled(enabled: boolean): void {
+  SettingsStore.set('llm_enabled', enabled ? 'true' : 'false');
+}
+
 export function getLLMSettings(): LLMSettings {
   return {
-    provider: DatabaseService.getSetting('llm_provider', 'ollama') as LLMProvider,
-    model: DatabaseService.getSetting('llm_model', 'qwen2.5:7b'),
-    apiKey: DatabaseService.getSetting('llm_api_key', ''),
-    baseUrl: DatabaseService.getSetting('llm_base_url', 'http://localhost:11434'),
+    provider: SettingsStore.get('llm_provider', 'ollama') as LLMProvider,
+    model: SettingsStore.get('llm_model', 'qwen2.5:7b'),
+    apiKey: SettingsStore.get('llm_api_key', ''),
+    baseUrl: SettingsStore.get('llm_base_url', 'http://localhost:11434'),
   };
 }
 
 export function saveLLMSettings(settings: Partial<LLMSettings>): void {
-  if (settings.provider !== undefined) DatabaseService.setSetting('llm_provider', settings.provider);
-  if (settings.model !== undefined) DatabaseService.setSetting('llm_model', settings.model);
-  if (settings.apiKey !== undefined) DatabaseService.setSetting('llm_api_key', settings.apiKey);
-  if (settings.baseUrl !== undefined) DatabaseService.setSetting('llm_base_url', settings.baseUrl);
+  if (settings.provider !== undefined) SettingsStore.set('llm_provider', settings.provider);
+  if (settings.model !== undefined) SettingsStore.set('llm_model', settings.model);
+  if (settings.apiKey !== undefined) SettingsStore.set('llm_api_key', settings.apiKey);
+  if (settings.baseUrl !== undefined) SettingsStore.set('llm_base_url', settings.baseUrl);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

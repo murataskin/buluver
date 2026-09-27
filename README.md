@@ -40,26 +40,27 @@ flowchart TD
         C["WorkerPool (Çok Çekirdekli Ayrıştırıcı)"]
         D["DocumentParser (UDF / DOCX / DOC / PDF Çözücü)"]
         E["Hukuki Varlık Çıkarıcı (Heuristics)"]
-        F["EmbeddingService (ONNX MiniLM-L12)"]
+        F["Embedding & AI Engine (ONNX / Ollama - Opsiyonel)"]
     end
 
     subgraph Veritabani["🗄️ SQLite Veritabanı (~/.buluver/buluver.db)"]
         G[("files (Meta + Gövde)")]
         H[("files_fts (FTS5 Trigram/Unicode61)")]
         I[("file_metadata (Mahkeme, Esas, Taraflar, Özet)")]
-        J[("file_chunks (Float32 Vektörler + Cosine UDF)")]
+        J[("file_chunks (Float32 Vektörler - Opsiyonel)")]
     end
 
     subgraph Arayuzler["🔌 Kullanım ve Entegrasyon"]
-        K["Terminal CLI (buluver search / index / config)"]
+        K["Terminal CLI (buluver search / index / model / setup / config)"]
         L["FastMCP Server (stdio & SSE - Port 3012)"]
         M["AI Ajanları (Claude Desktop, Antigravity, Cursor)"]
     end
 
-    Girdiler --> B --> C --> D --> E & F
+    Girdiler --> B --> C --> D --> E
+    D -.->|Vektör Modu Aktifse| F
     D --> G --> H
     E --> I
-    F --> J
+    F -.-> J
 
     G & H & I & J --> K
     G & H & I & J --> L
@@ -70,6 +71,13 @@ flowchart TD
 
 ## 🚀 Temel Yetenekler
 
+* **Esnek ve Opsiyonel Çalışma Modları (FTS / Vektör / Tam AI):**
+  * **FTS-Only (Sıfır AI Bağımlılığı):** Hiçbir model indirmeden, disk ve bellek harcamadan saf SQLite FTS5 (BM25) ve Trigram ile on binlerce sayfayı anında tarar.
+  * **Vektör Modu:** Küratörlü model kataloğundan (`minilm-l12`, `nomic-embed`, `bge-m3`, `multilingual-e5`) seçilen yerel modelle (ONNX veya Ollama) anlamsal arama yapar.
+  * **Tam AI Modu:** Vektör aramasını yerel LLM (Ollama, OpenAI, Gemini) ile otomatik özet ve etiket üretimiyle taçlandırır.
+* **Küratörlü Model Kataloğu & Kesintisiz Geçiş:**
+  * Tek doğruluk kaynağı olarak belirlenen 4 dengeli model (`minilm-l12`, `nomic-embed`, `bge-m3`, `multilingual-e5`).
+  * Model değiştiğinde eski vektörlerin uyumsuzluğunu otomatik algılayıp güvenli rebuild akışı çalıştırır.
 * **Kapsamlı Format Desteği:**
   * **`.udf` (UYAP):** ZIP arşivinden XML CDATA bloklarını okur; bozuk veya uncompressed XML dosyaları için otomatik düz metin kurtarma mekanizmasına sahiptir.
   * **`.docx` (Microsoft Word):** `mammoth` motoruyla tabloları ve gövde metnini çözer.
@@ -83,11 +91,12 @@ flowchart TD
   * **Belge Türü ve Konusu:** Dilekçe konusu veya dosya adından türetilen hukuki konu.
 * **Hibrit Arama Motoru (Hybrid Search / Reciprocal Rank Fusion - RRF):**
   * **FTS5:** Türkçe `unicode61 remove_diacritics 2` sözcük çözümleyicisiyle anında ve tam metin araması.
-  * **Vektör Benzerliği:** Yerel ONNX modeli (`Xenova/paraphrase-multilingual-MiniLM-L12-v2`) ile 800 karakterlik parçalarda kosinüs benzerliği.
-  * **RRF:** Anahtar kelime ve anlamsal benzerlik skorlarını dengeli biçimde harmanlar:
-    $$\text{RRF}(d) = \frac{1}{60 + \text{Rank}_{\text{FTS}}(d)} + \frac{1}{60 + \text{Rank}_{\text{Semantic}}(d)}$$
-* **Sıfır C++ Bağımlılığı (Zero C++ Addons):**
-  * Node 22+ ve Node 26 ile gelen yerleşik `node:sqlite` (`DatabaseSync`) motorunu kullanır. `node-gyp`, Xcode CLI araçları veya C++ derleyici hatalarından tamamen uzaktır.
+  * **Trigram (Infix):** Kelime ortasından, plaka, esas no parçası arama desteği (örn: `gıtay`, `3682`).
+  * **Vektör Benzerliği:** Seçili katalog modeli ile kosinüs benzerliği. (Vektör kapalıysa zarifçe FTS5'e düşer).
+  * **RRF:** Anahtar kelime ve anlamsal benzerlik skorlarını dengeli biçimde harmanlar.
+* **Sıfır C++ Bağımlılığı & Tembel Yükleme (Zero C++ Addons & Lazy Loading):**
+  * Node 22+ yerleşik `node:sqlite` (`DatabaseSync`) motorunu kullanır.
+  * ONNX transformer kütüphaneleri tembel yüklenerek CLI başlatma süresi **<25 ms** seviyesinde tutulur.
 * **Bulut Placeholder Koruması (macOS `SF_DATALESS`):**
   * iCloud Drive, OneDrive Files On-Demand veya Google Drive yerel alanlarında yalnızca bulutta olan ve diskte yer kaplamayan dosyaların istemsizce indirilmesini engeller.
 * **Çok Çekirdekli Paralel Ayrıştırma:**
@@ -115,7 +124,38 @@ Global kurulum sonrasında sisteminizin her yerinden `buluver` komutunu doğruda
 
 ## 💻 CLI Kullanım Kılavuzu
 
-### 1. Sistem Durumu ve Yapılandırma (`status` & `config`)
+### 1. Akıllı Kurulum ve Mod Seçimi (`setup`)
+
+```bash
+# Saf tam metin modu: Sıfır model indirme, sıfır AI yükü (ultra hızlı)
+buluver setup --fts-only
+
+# Vektör arama modu ile kurulum (varsayılan minilm-l12 veya seçilen model)
+buluver setup --mode embeddings
+
+# Belirli bir model ile kurulum
+buluver setup --mode embeddings --model bge-m3
+
+# Tam AI modu (Vektör + LLM özetleyici)
+buluver setup --mode full
+```
+
+### 2. Model Kataloğu ve Yönetimi (`model`)
+
+```bash
+# Desteklenen küratörlü model kataloğunu listele
+buluver model list
+
+# Şu anda aktif modeli ve indeks uyumluluk durumunu gör
+buluver model current
+
+# Katalogdan yeni bir model seç (gerekirse mevcut indeksler otomatik baştan üretilir)
+buluver model use bge-m3
+buluver model use nomic-embed
+buluver model use minilm-l12
+```
+
+### 3. Sistem Durumu ve Yapılandırma (`status` & `config`)
 
 ```bash
 # Genel sistem ve indeks durumunu gör
@@ -124,11 +164,15 @@ buluver status
 # Mevcut model, LLM, chunk ve depolama ayarlarını gör
 buluver config
 
-# Aktif ONNX vektör embedding modelini değiştir
-buluver config model Xenova/paraphrase-multilingual-MiniLM-L12-v2
+# Vektör embedding özelliğini aç veya kapat
+buluver config embeddings off
+buluver config embeddings on
 
-# Modeli değiştir ve tüm indeksli belgelerin vektörlerini hemen baştan üret
-buluver config model intfloat/multilingual-e5-base --rebuild
+# LLM özetleme ve etiketlemeyi aç veya kapat
+buluver config llm-enable on
+
+# Model seç (veya mevcut modeli gör)
+buluver config model bge-m3
 
 # LLM Sağlayıcısını Ayarla (Ollama / OpenAI / Gemini)
 buluver config llm --provider ollama --model qwen2.5:3b --base-url http://localhost:11434
@@ -147,7 +191,7 @@ buluver config chunking --size 800 --overlap 150 --rebuild
 buluver reindex-embeddings
 ```
 
-### 2. Klasör Yönetimi ve İndeksleme (`add`, `remove`, `folders`, `index`)
+### 4. Klasör Yönetimi ve İndeksleme (`add`, `remove`, `folders`, `index`)
 
 ```bash
 # Klasör ekle ve hemen indeksle
@@ -169,7 +213,7 @@ buluver index --ai
 buluver remove ~/Documents/Davalar
 ```
 
-### 3. Arama (`search`)
+### 5. Arama (`search`)
 
 ```bash
 # Hızlı anahtar kelime araması (FTS5 Boolean - Varsayılan)
@@ -191,7 +235,7 @@ buluver search "işçinin haksız feshi durumunda hakları" --mode semantic
 buluver search "tahliye ihtarı" --limit 5 --json
 ```
 
-### 4. Belge İnceleme (`read`)
+### 6. Belge İnceleme (`read`)
 
 ```bash
 # UDF, DOCX veya PDF belgesini ayrıştırıp metnini ve metadatasını ekrana dök
@@ -200,7 +244,7 @@ buluver read ./karar.docx
 buluver read ./tutanak.pdf --meta-only
 ```
 
-### 5. Canlı İzleme Modu (`watch`)
+### 7. Canlı İzleme Modu (`watch`)
 
 ```bash
 # Klasörleri izler; yeni eklenen/değişen belgeleri anında otomatik indeksler

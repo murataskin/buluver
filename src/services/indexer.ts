@@ -4,12 +4,17 @@ import * as os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import chokidar, { type FSWatcher } from 'chokidar';
-import { DatabaseService } from './database.js';
+import { FolderStore } from './folder-store.js';
+import {
+  DocumentRepository,
+  type IndexableDocument,
+  type IndexableChunk
+} from './document-repository.js';
 import { DocumentParser } from './doc-parser.js';
 import { walk } from './walker.js';
 import type { ParseTask, ParsedRecord } from './indexWorker.js';
-import { generateEmbedding, chunkText } from './embeddings.js';
-import { generateMetadata } from './llm.js';
+import { generateEmbedding, chunkText, isEmbeddingsEnabled } from './embeddings.js';
+import { generateMetadata, isLlmEnabled } from './llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -94,22 +99,33 @@ export const IndexerService = {
 
   emitStatus(info: string, progress = 0) {
     if (progressCallback) {
+      const stats = DocumentRepository.getStats();
       progressCallback({
         isScanning: isIndexing,
         progress,
         info,
-        folders: DatabaseService.getFolders().map(f => f.path),
-        filesCount: DatabaseService.getAllFiles().length
+        folders: FolderStore.getFolders().map(f => f.path),
+        filesCount: stats.totalFiles
       });
     }
   },
 
-  async scanAllRegisteredFolders(options: IndexerOptions = { withEmbeddings: true, withAiMetadata: false }): Promise<{
+  async scanAllRegisteredFolders(options?: IndexerOptions): Promise<{
     scanned: number;
     parsed: number;
     skipped: number;
     removed: number;
   }> {
+    const withEmbeddings = options?.withEmbeddings !== undefined
+      ? options.withEmbeddings
+      : isEmbeddingsEnabled();
+
+    const withAiMetadata = options?.withAiMetadata !== undefined
+      ? options.withAiMetadata
+      : isLlmEnabled();
+
+    const effectiveOptions: IndexerOptions = { withEmbeddings, withAiMetadata };
+
     if (isIndexing) {
       throw new Error("İndeksleme işlemi zaten devam ediyor.");
     }
@@ -118,7 +134,7 @@ export const IndexerService = {
 
     this.emitStatus('Dizinler taranıyor...', 0);
 
-    const folders = DatabaseService.getFolders();
+    const folders = FolderStore.getFolders();
     const workerPool = getPool();
 
     let totalScanned = 0;
@@ -140,7 +156,7 @@ export const IndexerService = {
 
       throttleEmit(`Dizin taranıyor: ${folder.path}`, 0, true);
 
-      const known = DatabaseService.getKnownFileStats(folder.path);
+      const known = DocumentRepository.getKnownFileStats(folder.path);
       const keepPaths = new Set<string>();
 
       let pendingBatch: any[] = [];
@@ -152,25 +168,22 @@ export const IndexerService = {
 
       const flush = async () => {
         if (pendingBatch.length === 0) return;
-        const inserted = DatabaseService.upsertFilesBatch(pendingBatch);
-        totalParsed += pendingBatch.length;
+        const currentBatch = pendingBatch;
         pendingBatch = [];
-        throttleEmit(
-          `İçerik dizinleniyor... (${totalParsed} yeni/güncel dosya)`,
-          Math.min(99, 10 + Math.floor((totalParsed / (totalParsed + totalSkipped || 1)) * 80))
-        );
 
-        // Post-process metadata and embeddings
-        for (const item of inserted) {
+        const completeDocs: IndexableDocument[] = [];
+
+        for (const item of currentBatch) {
           try {
+            const body = item.body ?? '';
             // 1. Fast regex heuristics parse
-            const heuristicMeta = DocumentParser.extractMetadataHeuristics(item.body, item.filename);
+            const heuristicMeta = DocumentParser.extractMetadataHeuristics(body, item.filename);
 
             // 2. Optional AI metadata generation
             let finalMeta = heuristicMeta;
-            if (options.withAiMetadata && item.body.trim().length > 50) {
+            if (effectiveOptions.withAiMetadata && body.trim().length > 50) {
               try {
-                const aiMeta = await generateMetadata(item.body);
+                const aiMeta = await generateMetadata(body);
                 finalMeta = {
                   ...heuristicMeta,
                   summary: aiMeta.summary,
@@ -180,13 +193,13 @@ export const IndexerService = {
                 console.error(`[AI] Metadata generation failed for ${item.path}:`, aiErr);
               }
             }
-            DatabaseService.upsertFileMetadata(item.id, finalMeta);
 
             // 3. Optional local embeddings generation
-            if (options.withEmbeddings && item.body.trim().length > 0) {
-              const chunks = chunkText(item.body);
+            let chunkData: IndexableChunk[] | undefined;
+            if (effectiveOptions.withEmbeddings && body.trim().length > 0) {
+              const chunks = chunkText(body);
               if (chunks.length > 0) {
-                const chunkData: { chunkIndex: number; text: string; embedding: Float32Array }[] = [];
+                chunkData = [];
                 for (let i = 0; i < chunks.length; i++) {
                   try {
                     const embedding = await generateEmbedding(chunks[i]);
@@ -199,15 +212,33 @@ export const IndexerService = {
                     console.error(`[Embedding] Failed on chunk ${i} of ${item.path}:`, embErr);
                   }
                 }
-                if (chunkData.length > 0) {
-                  DatabaseService.saveFileChunks(item.id, chunkData);
-                }
               }
             }
+
+            completeDocs.push({
+              path: item.path,
+              filename: item.filename,
+              extension: item.ext,
+              mtime: item.mtimeMs,
+              size: item.size,
+              body,
+              metadata: finalMeta,
+              chunks: chunkData
+            });
           } catch (err) {
-            console.error(`Post-processing failed for file ${item.path}:`, err);
+            console.error(`Enrichment failed for file ${item.path}:`, err);
           }
         }
+
+        if (completeDocs.length > 0) {
+          DocumentRepository.saveDocumentsBatch(completeDocs);
+          totalParsed += completeDocs.length;
+        }
+
+        throttleEmit(
+          `İçerik dizinleniyor... (${totalParsed} yeni/güncel dosya)`,
+          Math.min(99, 10 + Math.floor((totalParsed / (totalParsed + totalSkipped || 1)) * 80))
+        );
       };
 
       const flushToParseBuffer = () => {
@@ -259,7 +290,7 @@ export const IndexerService = {
         await Promise.all(pendingWork);
         await flush();
 
-        const removed = DatabaseService.pruneMissing(folder.path, keepPaths);
+        const removed = DocumentRepository.pruneMissing(folder.path, keepPaths);
         totalRemoved += removed;
 
       } catch (err) {
@@ -278,13 +309,23 @@ export const IndexerService = {
     };
   },
 
-  async indexFolder(folderPath: string, options: IndexerOptions = { withEmbeddings: true, withAiMetadata: false }) {
-    DatabaseService.addFolder(folderPath);
+  async indexFolder(folderPath: string, options?: IndexerOptions) {
+    FolderStore.addFolder(folderPath);
     return this.scanAllRegisteredFolders(options);
   },
 
-  startWatchingFolder(folderPath: string, options: IndexerOptions = { withEmbeddings: true, withAiMetadata: false }) {
+  startWatchingFolder(folderPath: string, options?: IndexerOptions) {
     if (watchers.has(folderPath)) return;
+
+    const withEmbeddings = options?.withEmbeddings !== undefined
+      ? options.withEmbeddings
+      : isEmbeddingsEnabled();
+
+    const withAiMetadata = options?.withAiMetadata !== undefined
+      ? options.withAiMetadata
+      : isLlmEnabled();
+
+    const effectiveOptions = { withEmbeddings, withAiMetadata };
 
     const watcher = chokidar.watch(folderPath, {
       ignored: /(^|[\/\\])\../,
@@ -301,23 +342,15 @@ export const IndexerService = {
 
         const body = await DocumentParser.parse(filePath);
         const ext = path.extname(filePath).toLowerCase();
+        const filename = path.basename(filePath);
 
-        const id = DatabaseService.upsertFile({
-          path: filePath,
-          filename: path.basename(filePath),
-          extension: ext,
-          mtime: stats.mtimeMs,
-          size: stats.size,
-          status: 'indexed',
-          last_indexed_at: Date.now()
-        });
+        let finalMeta: any;
+        let chunkData: IndexableChunk[] | undefined;
 
         if (body) {
-          DatabaseService.updateIndex(filePath, body);
-
-          const heuristicMeta = DocumentParser.extractMetadataHeuristics(body, path.basename(filePath));
-          let finalMeta = heuristicMeta;
-          if (options.withAiMetadata) {
+          const heuristicMeta = DocumentParser.extractMetadataHeuristics(body, filename);
+          finalMeta = heuristicMeta;
+          if (effectiveOptions.withAiMetadata && body.trim().length > 50) {
             try {
               const aiMeta = await generateMetadata(body);
               finalMeta = {
@@ -329,12 +362,11 @@ export const IndexerService = {
               console.error(`[AI] Metadata generation failed for ${filePath}:`, aiErr);
             }
           }
-          DatabaseService.upsertFileMetadata(id, finalMeta);
 
-          if (options.withEmbeddings) {
+          if (effectiveOptions.withEmbeddings && body.trim().length > 0) {
             const chunks = chunkText(body);
             if (chunks.length > 0) {
-              const chunkData: { chunkIndex: number; text: string; embedding: Float32Array }[] = [];
+              chunkData = [];
               for (let i = 0; i < chunks.length; i++) {
                 try {
                   const embedding = await generateEmbedding(chunks[i]);
@@ -347,13 +379,22 @@ export const IndexerService = {
                   console.error(`[Embedding] Failed on chunk ${i} of ${filePath}:`, err);
                 }
               }
-              if (chunkData.length > 0) {
-                DatabaseService.saveFileChunks(id, chunkData);
-              }
             }
           }
         }
-        this.emitStatus(`Dosya güncellendi: ${path.basename(filePath)}`, 100);
+
+        DocumentRepository.saveDocument({
+          path: filePath,
+          filename,
+          extension: ext,
+          mtime: stats.mtimeMs,
+          size: stats.size,
+          body,
+          metadata: finalMeta,
+          chunks: chunkData
+        });
+
+        this.emitStatus(`Dosya güncellendi: ${filename}`, 100);
       } catch (err) {
         console.error(`Watcher failed to index ${filePath}:`, err);
       }
@@ -362,7 +403,7 @@ export const IndexerService = {
     watcher.on('add', indexSingleFile);
     watcher.on('change', indexSingleFile);
     watcher.on('unlink', (filePath) => {
-      DatabaseService.removeFile(filePath);
+      DocumentRepository.removeDocument(filePath);
       this.emitStatus(`Dosya silindi: ${path.basename(filePath)}`, 100);
     });
 
@@ -378,7 +419,7 @@ export const IndexerService = {
   },
 
   startWatchingAll(options?: IndexerOptions) {
-    const folders = DatabaseService.getFolders();
+    const folders = FolderStore.getFolders();
     for (const folder of folders) {
       this.startWatchingFolder(folder.path, options);
     }
@@ -396,35 +437,34 @@ export const IndexerService = {
   },
 
   async enrichMissingMetadata(): Promise<void> {
-    const files = DatabaseService.getFilesWithoutSummary();
-    if (files.length === 0) return;
+    const docs = DocumentRepository.getDocumentsWithoutSummary();
+    if (docs.length === 0) return;
 
-    this.emitStatus(`AI özet üretiliyor... (0/${files.length})`, 0);
+    this.emitStatus(`AI özet üretiliyor... (0/${docs.length})`, 0);
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    for (let i = 0; i < docs.length; i++) {
+      const doc = docs[i];
       try {
-        const body = DatabaseService.getFileBody(file.id);
-        if (!body || !body.trim()) continue;
+        if (!doc.body || !doc.body.trim()) continue;
 
-        const heuristicMeta = DocumentParser.extractMetadataHeuristics(body, file.filename);
+        const heuristicMeta = DocumentParser.extractMetadataHeuristics(doc.body, doc.filename);
         let finalMeta = heuristicMeta;
         try {
-          const aiMeta = await generateMetadata(body);
+          const aiMeta = await generateMetadata(doc.body);
           finalMeta = {
             ...heuristicMeta,
             summary: aiMeta.summary,
             tags: aiMeta.tags,
           };
         } catch (aiErr) {
-          console.error(`[AI] Metadata generation failed for ${file.path}:`, aiErr);
+          console.error(`[AI] Metadata generation failed for ${doc.path}:`, aiErr);
         }
 
-        DatabaseService.upsertFileMetadata(file.id, finalMeta);
-        const progress = Math.floor(((i + 1) / files.length) * 100);
-        this.emitStatus(`AI özet üretiliyor... (${i + 1}/${files.length})`, progress);
+        DocumentRepository.updateMetadata(doc.path, finalMeta);
+        const progress = Math.floor(((i + 1) / docs.length) * 100);
+        this.emitStatus(`AI özet üretiliyor... (${i + 1}/${docs.length})`, progress);
       } catch (err) {
-        console.error(`AI enrichment error for ${file.path}:`, err);
+        console.error(`AI enrichment error for ${doc.path}:`, err);
       }
     }
 

@@ -11,7 +11,8 @@
     "build": "tsc && chmod +x dist/cli.js",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
-    "mcp": "tsx src/cli.ts mcp"
+    "mcp": "tsx src/cli.ts mcp",
+    "test": "tsx --test tests/**/*.test.ts"
   },
   "keywords": [
     "udf",
