@@ -9,6 +9,7 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": false,
+    "declaration": true,
     "resolveJsonModule": true
   },
   "include": [

@@ -3,17 +3,35 @@
   "version": "1.0.0",
   "description": "Buluver: High-performance Turkish legal document (UDF/UYAP, DOCX, PDF) search engine, CLI, and FastMCP server for AI agents",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "type": "module",
   "bin": {
     "buluver": "./dist/cli.js"
   },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js",
+    "prepublishOnly": "npm run build && npm test",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "mcp": "tsx src/cli.ts mcp",
     "test": "tsx --test tests/**/*.test.ts"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/murataskin/buluver.git"
+  },
+  "homepage": "https://github.com/murataskin/buluver#readme",
+  "bugs": {
+    "url": "https://github.com/murataskin/buluver/issues"
+  },
+  "author": "Murat Can Aşkın",
+  "license": "MIT",
   "keywords": [
     "udf",
     "uyap",
